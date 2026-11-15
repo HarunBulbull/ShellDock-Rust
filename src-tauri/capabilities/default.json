@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "Main workspace capabilities",
+  "windows": ["main"],
+  "permissions": ["core:default", "dialog:allow-open", "dialog:allow-save"]
+}
