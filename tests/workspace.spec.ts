@@ -43,6 +43,10 @@ async function mockDesktop(page: Page) {
       },
       __TAURI_EVENT_PLUGIN_INTERNALS__: { unregisterListener: () => {} },
       __TAURI_INTERNALS__: {
+        metadata: {
+          currentWindow: { label: "main" },
+          currentWebview: { label: "main" },
+        },
         transformCallback: (cb: (data: unknown) => void) => {
           callbacks.set(++seq, cb);
           return seq;
@@ -85,9 +89,9 @@ async function mockDesktop(page: Page) {
             const result = {
               completedBytes: 2400,
               totalBytes: 2400,
-              completedFiles: 2,
+              completedFiles: (window as any).__skipAll ? 0 : 2,
               totalFiles: 2,
-              skippedFiles: 0,
+              skippedFiles: (window as any).__skipAll ? 2 : 0,
               current: "",
               status: "completed",
             };
@@ -288,7 +292,7 @@ test("Ctrl selection uploads a batch to the current remote directory", async ({
     "C:\\Users\\tester\\Desktop\\beta.txt",
   ]);
   expect(request.destination).toBe("/home/tester");
-  expect(request.policy).toBe("skip");
+  expect(request.policy).toBe("replace");
 });
 test("Explorer native drop accepts multiple paths and targets the hovered folder", async ({
   page,
@@ -377,4 +381,105 @@ test("remote multi-selection downloads into the visible local folder", async ({
   );
   expect(request.upload).toBe(false);
   expect(request.sources).toHaveLength(2);
+});
+
+test("file lists support type-to-select, F2 rename and Delete with explicit confirmation", async ({
+  page,
+}) => {
+  await mockDesktop(page);
+  await page.goto("/");
+  await connect(page);
+  const local = page.getByRole("listbox", { name: "Local directory" });
+  await local.focus();
+  await page.keyboard.press("b");
+  await expect(local.getByRole("option", { name: /beta.txt/ })).toHaveAttribute(
+    "aria-selected",
+    "true",
+  );
+  await page.keyboard.press("F2");
+  const dialog = page.getByRole("dialog", { name: "File operation" });
+  await dialog.getByLabel("Name", { exact: true }).fill("renamed.txt");
+  await dialog.getByRole("button", { name: "Confirm" }).click();
+  expect(
+    await page.evaluate(
+      () =>
+        (window as any).__commands.find((c: any) => c.cmd === "local_action")
+          .args,
+    ),
+  ).toEqual({
+    action: "rename",
+    paths: ["C:\\Users\\tester\\Desktop\\beta.txt"],
+    name: "renamed.txt",
+  });
+  await local.getByRole("option", { name: /alpha.txt/ }).click();
+  await local
+    .getByRole("option", { name: /beta.txt/ })
+    .click({ modifiers: ["Control"] });
+  await page.keyboard.press("Delete");
+  await expect(dialog.getByRole("heading")).toHaveText("Delete local items?");
+  // Opening the confirmation must not delete anything.
+  expect(
+    await page.evaluate(
+      () =>
+        (window as any).__commands.filter((c: any) => c.cmd === "local_action")
+          .length,
+    ),
+  ).toBe(1);
+  await dialog.getByRole("button", { name: "Confirm" }).click();
+  expect(
+    await page.evaluate(
+      () =>
+        (window as any).__commands
+          .filter((c: any) => c.cmd === "local_action")
+          .at(-1).args,
+    ),
+  ).toEqual({
+    action: "delete",
+    paths: [
+      "C:\\Users\\tester\\Desktop\\alpha.txt",
+      "C:\\Users\\tester\\Desktop\\beta.txt",
+    ],
+    name: null,
+  });
+  const remote = page.getByRole("listbox", { name: "Remote directory" });
+  await remote.focus();
+  await page.keyboard.press("h");
+  await expect(
+    remote.getByRole("option", { name: /hello.txt/ }),
+  ).toHaveAttribute("aria-selected", "true");
+  await page.keyboard.press("Delete");
+  await expect(dialog.getByRole("heading")).toHaveText("Delete remote item?");
+  await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+  expect(
+    await page.evaluate(
+      () =>
+        (window as any).__commands.filter((c: any) => c.cmd === "remote_action")
+          .length,
+    ),
+  ).toBe(0);
+});
+
+test("skipped uploads never claim files were transferred", async ({ page }) => {
+  await mockDesktop(page);
+  await page.goto("/");
+  await connect(page);
+  await page.evaluate(() => ((window as any).__skipAll = true));
+  await page
+    .getByRole("listbox", { name: "Local directory" })
+    .getByRole("option", { name: /alpha.txt/ })
+    .click();
+  await page.getByRole("button", { name: "Upload selection" }).click();
+  await expect(
+    page.getByRole("combobox", { name: "Conflict policy" }),
+  ).toHaveValue("replace");
+  await page
+    .getByRole("combobox", { name: "Conflict policy" })
+    .selectOption("skip");
+  await page.getByRole("button", { name: "Start upload" }).click();
+  await expect(
+    page.getByText("No files transferred — all items skipped"),
+  ).toBeVisible();
+  await expect(
+    page.getByText("Transfer complete", { exact: false }),
+  ).toHaveCount(0);
 });

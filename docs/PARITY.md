@@ -4,7 +4,7 @@ Kaynak incelemesi: `HarunBulbull/ShellDock`, bu çalışma sırasında `.referen
 
 İncelenen kaynak commit: `acce1c24e8c88d858f2efb3942487e9846eff856`.
 
-**Kodlandı** ifadesi her iş akışının uçtan uca doğrulandığı anlamına gelmez. v0.2.0'da sekiz Rust, yedi arayüz testi ve yalıtılmış gerçek Windows dosya akışı testi geçti; aşağıda doğrulanan ve bekleyen işler ayrıdır.
+**Kodlandı** ifadesi her iş akışının uçtan uca doğrulandığı anlamına gelmez. v0.2.1’de dokuz Rust, dokuz arayüz testi ve yalıtılmış gerçek Windows dosya akışı testi geçti; aşağıda doğrulanan ve bekleyen işler ayrıdır.
 
 | Kaynak işlev | Windows durumu | Sonraki doğrulama / iş |
 |---|---|---|
@@ -37,3 +37,5 @@ Kaynak incelemesi: `HarunBulbull/ShellDock`, bu çalışma sırasında `.referen
 | Oturum restorasyonu | Planlandı | Sürümlemeli workspace şeması |
 
 Öncelik: büyük dosya/kesinti testleri → kalıcı kuyruk ve devam → senkronizasyon → dışa sürükleme ve Explorer bağlam menüsü entegrasyonu. Yerel/uzak çift panel ve ilk toplu klasör transferi akışı tamamlandı.
+
+Yerel dosya silme/yeniden adlandırma, Delete/F2 ve harfle seçim v0.2.1’de eklendi. Yerel sürükleme pointer hareketleriyle test edilir. Üzerine yazma sonrası indirilen içerik yeniden karşılaştırılır; yanlış veri döndüren fixture sunucusu başarı yerine hata üretir.

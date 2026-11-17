@@ -661,6 +661,7 @@ pub fn run() {
             write_remote,
             transfer,
             files::list_local,
+            files::local_action,
             files::transfer_batch,
             files::cancel_transfer
         ])
@@ -875,6 +876,18 @@ mod tests {
             .read_to_string(&mut replaced)
             .unwrap();
         assert_eq!(replaced, "replacement contents");
+        let corrupt = source_dir.path().join("__corrupt_upload.txt");
+        fs::write(&corrupt, b"expected bytes").unwrap();
+        let corrupt_request = files::BatchRequest {
+            job_id: "corrupt-server".into(),
+            sources: vec![corrupt.to_string_lossy().into()],
+            destination: "/".into(),
+            upload: true,
+            policy: "replace".into(),
+        };
+        assert!(files::run_batch(&ctx, &corrupt_request, &cancel, |_| {})
+            .unwrap_err()
+            .contains("verification failed"));
         {
             let mut original = sftp.create(Path::new("/__reject_commit.txt")).unwrap();
             original.write_all(b"original must survive").unwrap();

@@ -30,7 +30,7 @@ v0.2.0 dosya yöneticisi `files.rs` içindeki batch motorunu kullanır. Seçilen
 
 React paneli oturum başına bellekte sıralı kuyruk tutar. Sekme/panel gizlenmesi paneli unmount etmez; iş ve kuyruk korunur. Oturum kapatma/değiştirme iptal tokenını ayarlar ve bekleyen işleri temizler. İptal worker tarafından planlama, dosya ve blok sınırlarında kontrol edilir; bloklayan ağ çağrısının timeout'una kadar gecikebilir. Kuyruk kalıcı değildir; pause/resume/retry henüz yoktur.
 
-Explorer girişleri `tauri://drag-*` olaylarından gerçek dosya yollarını alır; fiziksel koordinatlar cihaz piksel oranıyla CSS koordinatlarına çevrilir. Hedef görünür uzak panel veya imlecin altındaki uzak klasördür. Yerel panel iç sürükleme için özel bir DOM veri türü kullanır. İki yol da aynı onay ve transfer motoruna gider.
+Explorer girişleri `getCurrentWebview().onDragDropEvent` üzerinden gerçek dosya yollarını alır; fiziksel koordinatlar cihaz piksel oranıyla CSS koordinatlarına çevrilir. Hedef görünür uzak panel veya imlecin altındaki uzak klasördür. Windows’ta yerel panel iç sürüklemesi pointer capture ile çalışır. Tauri native drop handler açıkken HTML5 sürükleme WebView2 tarafından engellenir; yerel kaynak native sürüklemeye dönüştürülmez. İki yol da aynı onay ve transfer motoruna gider.
 
 Uzak düzenleyici 2 MB UTF-8 sınırındadır. Kaydetme açık kullanıcı onaylıdır, doğrudan truncate/write yapar. Atomik kayıt ve uzak sürüm çatışması denetimi tamamlanmadan kritik dosyalar için güvenilirlik iddiası yapılmaz.
 
@@ -38,7 +38,7 @@ Uzak düzenleyici 2 MB UTF-8 sınırındadır. Kaydetme açık kullanıcı onayl
 
 Arayüz testleri gerçek Chromium + taklit Tauri IPC kullanır. Host güven kararı olmadan `connect` çağrılmadığını, sekme bağımsızlığını ve SFTP seçimini denetler; tarayıcı hatalarını başarısız sayar.
 
-Rust testlerindeki Node SSH fixture loopback'te rastgele port açar; RSA/Ed25519 anahtarları ve SFTP dosyaları geçicidir. SSH/credential testlerine ek olarak batch yükleme/indirme, boş ve iç içe klasörler, Skip/Replace, iptal temizliği ve sunucunun rename hatasında rollback doğrulanır. Sekiz Rust testi Windows üzerinde geçti.
+Rust testlerindeki Node SSH fixture loopback'te rastgele port açar; RSA/Ed25519 anahtarları ve SFTP dosyaları geçicidir. SSH/credential testlerine ek olarak batch yükleme/indirme, boş ve iç içe klasörler, Skip/Replace, iptal temizliği ve sunucunun rename hatasında rollback doğrulanır. Dokuz Rust testi Windows üzerinde geçti.
 
 Gerçek optimize `.exe`, geçici loopback CDP portuyla Playwright üzerinden açıldı; WebView2 içeriği, Rust IPC ve bağlantı formu doğrulandı. Ayrı OpenSSL DLL bağımlılığı bulunmadığı PE import tablosundan kontrol edildi. NSIS x64 kurulumu üretildi; kurulum/kaldırma sihirbazı henüz denenmedi. İlk yerel release paketinde aynı kaynak sürümünden derlenmiş `/O2` statik OpenSSL kütüphaneleri yeniden kullanıldı; normal `npm run tauri build` gerektiğinde bu kütüphaneleri vendored kaynaklardan derler.
 
@@ -49,3 +49,7 @@ Gerçek optimize `.exe`, geçici loopback CDP portuyla Playwright üzerinden aç
 3. Mevcut sıralı motorun büyük dosya/kesinti/disk doluluğu testlerini genişlet; kalıcı kuyruk ve devam ekle.
 4. Şema migration, tercihler, oturum restorasyonu, erişilebilir modal odak yönetimi ve Türkçe yerelleştirme ekle.
 5. Kaynak projedeki ileri SFTP özellikleri ve Windows entegrasyonunu tamamla; imzalı kurulum dağıtımını ayrı doğrula.
+
+## v0.2.1 dosya düzeltmeleri
+
+Replace onay diyaloğunda varsayılandır. Yükleme hedefi commit sonrasında yeniden açılır; içerik bloklar halinde yerel kaynakla karşılaştırılır. Boyut veya içerik uyuşmazlığında iş hata verir, tamamlanan dosya sayısı artmaz. Doğrulama iptal edilebilir; ek okuma trafiği oluşturur ve eşzamanlı uzak değişiklikleri kilitlemez. Tamamı atlanan bir iş “No files transferred” gösterir. Yerel silme/yeniden adlandırma Rust `local_action` komutundan yürür; kökler ve çakışan hedef adları reddedilir. Silme açık onaylıdır ve yerel klasörler rekürsif silinir.

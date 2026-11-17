@@ -140,21 +140,32 @@ async function main() {
     assert.ok(box);
     // Deliver the same native event payload that Windows Explorer sends. This
     // exercises the real Tauri event bridge, coordinates, confirmation and Rust IPC.
-    await page.evaluate(
-      ({ paths, x, y }) =>
-        window.__TAURI_INTERNALS__.invoke("plugin:event|emit", {
-          event: "tauri://drag-drop",
-          payload: {
-            paths,
-            position: { x: x * devicePixelRatio, y: y * devicePixelRatio },
-          },
-        }),
-      {
-        paths: [join(source, "first.txt"), join(source, "project")],
-        x: box.x + 60,
-        y: box.y + box.height - 30,
-      },
-    );
+    if (process.env.SHELLDOCK_PHYSICAL_DROP) {
+      await writeFile(
+        resolve(".tools/physical-drop-ready.json"),
+        JSON.stringify({ source, fixture, port, identifier }),
+      );
+      console.log("Waiting for physical Explorer drop from " + source);
+      await expect(
+        page.getByRole("heading", { name: "Upload 2 items" }),
+      ).toBeVisible({ timeout: 300000 });
+    } else
+      await page.evaluate(
+        ({ paths, x, y }) =>
+          window.__TAURI_INTERNALS__.invoke("plugin:event|emit_to", {
+            target: { kind: "Webview", label: "main" },
+            event: "tauri://drag-drop",
+            payload: {
+              paths,
+              position: { x: x * devicePixelRatio, y: y * devicePixelRatio },
+            },
+          }),
+        {
+          paths: [join(source, "first.txt"), join(source, "project")],
+          x: box.x + 60,
+          y: box.y + box.height - 30,
+        },
+      );
     await expect(
       page.getByRole("heading", { name: "Upload 2 items" }),
     ).toBeVisible();
@@ -163,6 +174,19 @@ async function main() {
     await expect(
       remote.getByRole("option", { name: /first.txt/ }),
     ).toBeVisible();
+    // Upload the same path again with different bytes. Verify the destination,
+    // rather than trusting a success label or a mocked transfer response.
+    await writeFile(
+      join(source, "first.txt"),
+      "replacement verified from server",
+    );
+    await local.getByRole("option", { name: /first.txt/ }).click();
+    await page.getByRole("button", { name: "Upload selection" }).click();
+    await expect(
+      page.getByRole("combobox", { name: "Conflict policy" }),
+    ).toHaveValue("replace");
+    await page.getByRole("button", { name: "Start upload" }).click();
+    await expect(page.getByText("Transfer complete — verified")).toBeVisible();
     await local
       .getByRole("option", { name: /second.txt/ })
       .dragTo(remote.getByRole("option", { name: /project/ }));
@@ -197,7 +221,7 @@ async function main() {
       .toBe("native internal drag");
     assert.equal(
       await readFile(join(destination, "first.txt"), "utf8"),
-      "native Explorer batch 🦀",
+      "replacement verified from server",
     );
     assert.equal(
       await readFile(
@@ -216,9 +240,39 @@ async function main() {
     await page.screenshot({
       path: "docs/screenshots/windows-files-native.png",
     });
+    await local.focus();
+    await page.keyboard.press("f");
+    await expect(
+      local.getByRole("option", { name: /first.txt/ }),
+    ).toHaveAttribute("aria-selected", "true");
+    await page.keyboard.press("F2");
+    await page
+      .getByRole("dialog", { name: "File operation" })
+      .getByLabel("Name", { exact: true })
+      .fill("renamed.txt");
+    await page.getByRole("button", { name: "Confirm", exact: true }).click();
+    await expect(
+      local.getByRole("option", { name: /renamed.txt/ }),
+    ).toBeVisible();
+    assert.equal(
+      await readFile(join(destination, "renamed.txt"), "utf8"),
+      "replacement verified from server",
+    );
+    await local.getByRole("option", { name: /renamed.txt/ }).click();
+    await local
+      .getByRole("option", { name: /project/ })
+      .click({ modifiers: ["Control"] });
+    await page.keyboard.press("Delete");
+    await expect(
+      page.getByRole("heading", { name: "Delete local items?" }),
+    ).toBeVisible();
+    await page.getByRole("button", { name: "Confirm", exact: true }).click();
+    await expect(local.getByRole("option")).toHaveCount(0);
+    await assert.rejects(access(join(destination, "renamed.txt")));
+    await assert.rejects(access(join(destination, "project")));
     assert.deepEqual(errors, []);
     console.log(
-      "PASS: real native event bridge, multi-root upload, nested folders, internal drag, download bytes and transfer summary.",
+      "PASS: native drop, multi-root upload, overwrite bytes, pointer drag, nested downloads, typeahead, F2 rename, Delete and transfer summary.",
     );
   } finally {
     if (browser) await browser.close();

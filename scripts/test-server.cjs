@@ -159,6 +159,12 @@ const server = new Server(
             const data = files.get(h?.path);
             if (!data) return sftp.status(id, STATUS_CODE.FAILURE);
             if (offset >= data.length) return sftp.status(id, STATUS_CODE.EOF);
+            // Simulate a server that acknowledges writes but returns old/wrong bytes.
+            if (h.path === "/__corrupt_upload.txt")
+              return sftp.data(
+                id,
+                Buffer.alloc(Math.min(length, data.length - offset), 120),
+              );
             sftp.data(id, data.subarray(offset, offset + length));
           });
           sftp.on("WRITE", (id, handle, offset, data) => {

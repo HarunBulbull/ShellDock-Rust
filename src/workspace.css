@@ -738,3 +738,12 @@ textarea {
     display: none;
   }
 }
+
+.local-browser .browser-row {
+  touch-action: none;
+  user-select: none;
+}
+.internal-dragging,
+.internal-dragging * {
+  cursor: copy !important;
+}

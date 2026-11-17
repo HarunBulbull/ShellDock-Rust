@@ -7,18 +7,18 @@
 
 Sunucularınızı, SSH oturumlarınızı ve yerel/uzak dosyalarınızı tek çalışma alanında yönetin. Orijinal ShellDock düzenindeki sunucu listesi, terminal ve Remote / Local / Both dosya panelleri Windows için uyarlandı.
 
-**v0.2.0 bir geliştirme önizlemesidir.** Çoklu dosya/klasör aktarımı ve yerel/uzak dosya panelleri kullanılabilir; macOS sürümüyle tam özellik eşitliği henüz sağlanmadı. [Eksikler ve yol haritası](docs/PARITY.md).
+**v0.2.1 bir geliştirme önizlemesidir.** Çoklu dosya/klasör aktarımı ve yerel/uzak dosya panelleri kullanılabilir; macOS sürümüyle tam özellik eşitliği henüz sağlanmadı. [Eksikler ve yol haritası](docs/PARITY.md).
 
 ## Windows için indir
 
 | Paket | İndirme |
 |---|---|
-| Windows x64 kurulum dosyası | [ShellDock_0.2.0_x64-setup.exe](https://github.com/HarunBulbull/ShellDock-Rust/releases/download/v0.2.0/ShellDock_0.2.0_x64-setup.exe) |
-| Taşınabilir paket — uygulama ve lisanslar | [ShellDock_0.2.0_windows-x64.zip](https://github.com/HarunBulbull/ShellDock-Rust/releases/download/v0.2.0/ShellDock_0.2.0_windows-x64.zip) |
-| Doğrudan çalıştırılabilir uygulama | [ShellDock_0.2.0_windows-x64.exe](https://github.com/HarunBulbull/ShellDock-Rust/releases/download/v0.2.0/ShellDock_0.2.0_windows-x64.exe) |
-| SHA-256 doğrulama değerleri | [SHA256SUMS.txt](https://github.com/HarunBulbull/ShellDock-Rust/releases/download/v0.2.0/SHA256SUMS.txt) |
+| Windows x64 kurulum dosyası | [ShellDock_0.2.1_x64-setup.exe](https://github.com/HarunBulbull/ShellDock-Rust/releases/download/v0.2.1/ShellDock_0.2.1_x64-setup.exe) |
+| Taşınabilir paket — uygulama ve lisanslar | [ShellDock_0.2.1_windows-x64.zip](https://github.com/HarunBulbull/ShellDock-Rust/releases/download/v0.2.1/ShellDock_0.2.1_windows-x64.zip) |
+| Doğrudan çalıştırılabilir uygulama | [ShellDock_0.2.1_windows-x64.exe](https://github.com/HarunBulbull/ShellDock-Rust/releases/download/v0.2.1/ShellDock_0.2.1_windows-x64.exe) |
+| SHA-256 doğrulama değerleri | [SHA256SUMS.txt](https://github.com/HarunBulbull/ShellDock-Rust/releases/download/v0.2.1/SHA256SUMS.txt) |
 
-[Sürüm notları ve tüm dosyalar](https://github.com/HarunBulbull/ShellDock-Rust/releases/tag/v0.2.0)
+[Sürüm notları ve tüm dosyalar](https://github.com/HarunBulbull/ShellDock-Rust/releases/tag/v0.2.1)
 
 Windows 10/11 x64 ve Microsoft Edge WebView2 Runtime gerekir. Hazır paketleri kullanmak için Rust, Node.js, Perl veya Visual Studio kurmanız gerekmez. Taşınabilir ZIP'i bir klasöre çıkarıp `ShellDock.exe` dosyasını açabilirsiniz.
 
@@ -26,7 +26,7 @@ Dosyalar kod imzalı değildir. Dosya transferleri geçici hedef kullanır; değ
 
 ![Windows uygulamasının gerçek WebView2 ekranı](docs/screenshots/windows-files-native.png)
 
-Gerçek `.exe` açılışı, WebView2 arayüzü ve Rust IPC otomatik testten geçti. Test kapsamı ve ilk derlemenin doğrulama değerleri: [v0.2.0 doğrulama kaydı](docs/VALIDATION_v0.2.0.md).
+Gerçek `.exe` açılışı, WebView2 arayüzü ve Rust IPC otomatik testten geçti. Test kapsamı ve ilk derlemenin doğrulama değerleri: [v0.2.1 doğrulama kaydı](docs/VALIDATION_v0.2.1.md).
 
 ## Kaynaktan geliştirme
 
@@ -66,9 +66,12 @@ Adres: `http://127.0.0.1:1420`. Tarayıcı önizlemesi SSH bağlantısı kuramaz
 - SHA-256 host anahtarı karşılaştırması; bilinmeyen/değişen anahtarlarda açık kullanıcı kararı.
 - İsteğe bağlı Windows Credential Manager parola ve anahtar parolası saklama.
 - SFTP gezinme, klasör oluşturma, yeniden adlandırma, dosya/boş klasör silme.
+- Yerel dosya/klasör silme, yeniden adlandırma; her iki panelde Delete, F2 ve harfle seçim. Yerel klasör silme altındaki içerikleri de siler ve onay ister.
 - Remote / Local / Both görünümü, yerel klasör gezinmesi, filtre, gizli dosyalar ve Ctrl/Shift çoklu seçimi.
 - Explorer’dan çoklu dosya ve klasör bırakma; yerel panelden uzak klasöre sürükleme.
 - İç içe/boş klasörleri koruyan toplu yükleme ve indirme, klasör birleştirme, Skip / Replace seçimi.
+- Varsayılan Replace; onay diyaloğundan sonra mevcut dosyanın üzerine yazma. Skip seçildiğinde atlanan dosyalar yüklenmiş sayılmaz.
+- Yükleme sonrası hedef içerik sunucudan tekrar okunup yerel dosyayla bayt bayt karşılaştırılır; bu ek ağ trafiği gerektirir.
 - Oturum açıkken sıralı transfer kuyruğu, iptal, byte/dosya ilerlemesi ve global transfer özeti.
 - 2 MB'a kadar UTF-8 uzak dosya düzenleme.
 
@@ -85,9 +88,9 @@ npm.cmd run tauri build
 npm.cmd run test:desktop
 ```
 
-- TypeScript/Vite üretim derlemesi ve yedi Playwright testi yerelde geçti.
+- TypeScript/Vite üretim derlemesi ve dokuz Playwright testi yerelde geçti.
 - Playwright gerçek Chromium kullanır; masaüstü IPC'sini taklit ederek sekme, host güven kararı, bağlantı durumu ve SFTP arayüzünü denetler. Bu, gerçek SSH taşıma testi değildir.
-- Sekiz Rust testi Windows üzerinde geçti: bağlantı doğrulama, kalıcılık, credential saklama/okuma/silme ve geçici loopback sunucusuyla gerçek SSH/SFTP protokol testi dahil.
+- Dokuz Rust testi Windows üzerinde geçti: bağlantı doğrulama, kalıcılık, credential saklama/okuma/silme ve geçici loopback sunucusuyla gerçek SSH/SFTP protokol testi dahil.
 - Clippy `--all-targets -- -D warnings` kontrolü geçti.
 - Gerçek Windows `.exe` dosyasında WebView2 açılışı, Rust IPC, yerel dosya listesi ve bağlantı formu kontrolü geçti. `test:desktop` yalnızca test işlemi için loopback debug portu açar; uygulama kapatılınca port kapanır. Bu kontrol sunucu kaydı oluşturmaz.
 - Ayrı, geçici uygulama profilinde gerçek native event köprüsü → toplu yükleme → uzak klasöre iç sürükleme → çoklu indirme testi geçti; indirilen içerikler kontrol edildi. Test aynı Tauri drop olayını programatik gönderir; fiziksel Explorer fare hareketi ayrıca elle doğrulanmalıdır.

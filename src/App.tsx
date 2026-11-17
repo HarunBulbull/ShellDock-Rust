@@ -231,7 +231,7 @@ export default function App() {
           <button onClick={() => setSettings(true)}>
             <Settings size={16} /> Settings & about
           </button>
-          <span className="small muted">v0.2.0 · Preview</span>
+          <span className="small muted">v0.2.1 · Preview</span>
         </div>
       </aside>
       <main className="main">
@@ -252,6 +252,7 @@ export default function App() {
               (t) =>
                 t.status === "planning" ||
                 t.status === "transferring" ||
+                t.status === "verifying" ||
                 t.queued > 0,
             ) && <span className="status-dot online" />}
           </button>
@@ -310,9 +311,16 @@ export default function App() {
                   <span>
                     <strong>{tab.connection.name}</strong>
                     <small>
-                      {transferInfo[tab.key].status} ·{" "}
-                      {transferInfo[tab.key].completed}/
+                      {transferInfo[tab.key].status === "completed" &&
+                      transferInfo[tab.key].completed === 0 &&
+                      transferInfo[tab.key].skipped > 0
+                        ? "all skipped"
+                        : transferInfo[tab.key].status}{" "}
+                      · {transferInfo[tab.key].completed}/
                       {transferInfo[tab.key].total} files
+                      {transferInfo[tab.key].skipped
+                        ? ` · ${transferInfo[tab.key].skipped} skipped`
+                        : ""}
                       {transferInfo[tab.key].queued
                         ? ` · ${transferInfo[tab.key].queued} queued`
                         : ""}
@@ -622,7 +630,7 @@ export default function App() {
             className="modal narrow"
           >
             <h2>ShellDock for Windows</h2>
-            <p>Version 0.2.0 · Development preview</p>
+            <p>Version 0.2.1 · Development preview</p>
             <p className="muted">Tauri 2 · React · Rust · libssh2 · xterm.js</p>
             <p>
               Host keys are pinned per host and port. Saved passwords and key

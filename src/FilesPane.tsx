@@ -1,6 +1,14 @@
-import { useEffect, useRef, useState, type MouseEvent } from "react";
+import {
+  useEffect,
+  useRef,
+  useState,
+  type MouseEvent,
+  type KeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
 import { Channel, invoke } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import type { UnlistenFn } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   ArrowUp,
@@ -48,6 +56,7 @@ export interface TransferStatus {
   completed: number;
   total: number;
   queued: number;
+  skipped: number;
 }
 const join = (base: string, name: string) =>
   `${base.replace(/\/$/, "")}/${name}`;
@@ -104,12 +113,14 @@ export default function FilesPane({
   const [error, setError] = useState(""),
     [loading, setLoading] = useState(false),
     [pending, setPending] = useState<Pending | null>(null),
-    [policy, setPolicy] = useState<"skip" | "replace">("skip"),
+    [policy, setPolicy] = useState<"skip" | "replace">("replace"),
     [progress, setProgress] = useState<Progress>(empty),
     [over, setOver] = useState(false),
     [transfersVisible, setTransfersVisible] = useState(true);
   const [operation, setOperation] = useState<{
       type: "mkdir" | "rename" | "delete";
+      local?: boolean;
+      paths?: string[];
       path: string;
       value: string;
     } | null>(null),
@@ -119,9 +130,17 @@ export default function FilesPane({
     anchor = useRef<Record<string, string>>({}),
     mounted = useRef(true);
   const busy =
-    progress.status === "planning" || progress.status === "transferring";
-  const snapshot = useRef({ id, active, busy, path });
-  snapshot.current = { id, active, busy, path };
+    progress.status === "planning" ||
+    progress.status === "transferring" ||
+    progress.status === "verifying";
+  const snapshot = useRef({ id, active, busy, path, blocked: false });
+  snapshot.current = {
+    id,
+    active,
+    busy,
+    path,
+    blocked: !!(pending || operation || edit),
+  };
   const transferCallback = useRef(onTransfer);
   transferCallback.current = onTransfer;
   useEffect(() => {
@@ -130,11 +149,13 @@ export default function FilesPane({
       completed: progress.completedFiles,
       total: progress.totalFiles,
       queued: queuedCount,
+      skipped: progress.skippedFiles,
     });
   }, [
     progress.status,
     progress.completedFiles,
     progress.totalFiles,
+    progress.skippedFiles,
     queuedCount,
   ]);
   async function loadLocal(next?: string) {
@@ -214,68 +235,60 @@ export default function FilesPane({
   useEffect(() => {
     if (!desktop) return;
     let disposed = false;
-    const unlisteners: UnlistenFn[] = [];
-    const attach = async () => {
-      for (const eventName of [
-        "tauri://drag-enter",
-        "tauri://drag-over",
-        "tauri://drag-drop",
-        "tauri://drag-leave",
-      ]) {
-        const unlisten = await listen<{
-          paths?: string[];
-          position?: { x: number; y: number };
-        }>(eventName, (event) => {
-          const current = snapshot.current;
-          if (!current.active || !current.id || !remoteElement.current) {
-            setOver(false);
+    let unlisten: UnlistenFn | undefined;
+    void getCurrentWebview()
+      .onDragDropEvent((event) => {
+        const current = snapshot.current;
+        if (
+          !current.active ||
+          !current.id ||
+          current.blocked ||
+          !remoteElement.current
+        ) {
+          setOver(false);
+          return;
+        }
+        const payload = event.payload;
+        if (payload.type === "leave") {
+          setOver(false);
+          return;
+        }
+        const x = payload.position.x / window.devicePixelRatio;
+        const y = payload.position.y / window.devicePixelRatio;
+        const hit = document.elementFromPoint(x, y);
+        const inside =
+          hit?.closest(".remote-browser") === remoteElement.current;
+        setOver(inside && payload.type !== "drop");
+        if (payload.type === "drop" && payload.paths.length) {
+          if (!inside) {
+            setError("Drop files inside the Remote file panel to upload them.");
             return;
           }
-          if (eventName === "tauri://drag-leave") {
-            setOver(false);
-            return;
-          }
-          const pos = event.payload.position;
-          if (!pos) return;
-          const x = pos.x / window.devicePixelRatio,
-            y = pos.y / window.devicePixelRatio,
-            rect = remoteElement.current.getBoundingClientRect();
-          const hit = document.elementFromPoint(x, y);
-          const inside =
-            rect.width > 0 &&
-            x >= rect.left &&
-            x <= rect.right &&
-            y >= rect.top &&
-            y <= rect.bottom &&
-            hit?.closest(".remote-browser") === remoteElement.current;
-          setOver(inside && eventName !== "tauri://drag-drop");
-          if (
-            eventName === "tauri://drag-drop" &&
-            inside &&
-            event.payload.paths?.length
-          ) {
-            const target = hit?.closest<HTMLElement>("[data-remote-directory]")
-              ?.dataset.remoteDirectory;
-            setPolicy("skip");
-            setPending({
-              sources: [...new Set(event.payload.paths)],
-              destination: target || current.path,
-              upload: true,
-            });
-          }
-        });
-        if (disposed) unlisten();
-        else unlisteners.push(unlisten);
-      }
-    };
-    void attach().catch((e) => {
-      if (!disposed) setError(errorText(e));
-    });
+          const target = hit?.closest<HTMLElement>("[data-remote-directory]")
+            ?.dataset.remoteDirectory;
+          setError("");
+          setPolicy("replace");
+          setPending({
+            sources: [...new Set(payload.paths)],
+            destination: target || current.path,
+            upload: true,
+          });
+        }
+      })
+      .then((fn) => {
+        if (disposed) fn();
+        else unlisten = fn;
+      })
+      .catch((e) => {
+        if (!disposed)
+          setError("Explorer drop handler could not start: " + errorText(e));
+      });
     return () => {
       disposed = true;
-      unlisteners.forEach((fn) => fn());
+      unlisten?.();
     };
   }, []);
+
   function select(
     event: MouseEvent,
     file: string,
@@ -307,7 +320,7 @@ export default function FilesPane({
   function queue(sources: string[], upload: boolean, destination?: string) {
     if (!id || !sources.length) return;
     setError("");
-    setPolicy("skip");
+    setPolicy("replace");
     setPending({
       sources,
       destination: destination ?? (upload ? path : (local?.path ?? "")),
@@ -413,20 +426,27 @@ export default function FilesPane({
     }
   }
   async function action() {
-    if (!operation || !id) return;
+    if (!operation || (!operation.local && !id)) return;
     try {
-      await invoke("remote_action", {
-        id,
-        action: operation.type,
-        path:
-          operation.type === "mkdir"
-            ? join(path, operation.value)
-            : operation.path,
-        destination:
-          operation.type === "rename" ? join(path, operation.value) : null,
-      });
+      if (operation.local) {
+        await invoke("local_action", {
+          action: operation.type,
+          paths: operation.paths || [operation.path],
+          name: operation.type === "rename" ? operation.value : null,
+        });
+      } else
+        for (const item of operation.paths || [operation.path])
+          await invoke("remote_action", {
+            id,
+            action: operation.type,
+            path:
+              operation.type === "mkdir" ? join(path, operation.value) : item,
+            destination:
+              operation.type === "rename" ? join(path, operation.value) : null,
+          });
       setOperation(null);
-      void loadRemote();
+      if (operation.local) void loadLocal(local?.path);
+      else void loadRemote();
     } catch (e) {
       setError(errorText(e));
     }
@@ -454,11 +474,181 @@ export default function FilesPane({
       e.name.toLowerCase().includes(remoteFilter.toLowerCase()),
   );
   const selectedRemote = remote.find((e) => e.path === remoteSelected[0]);
+  const typeahead = useRef({ side: "", text: "", time: 0 });
+  const internalDrag = useRef<null | {
+    x: number;
+    y: number;
+    paths: string[];
+    moved: boolean;
+    pointer: number;
+    element: HTMLElement;
+  }>(null);
+  const suppressClick = useRef(false);
+  const [dragging, setDragging] = useState(false);
+  function requestOperation(type: "rename" | "delete", isLocal: boolean) {
+    const selected = isLocal ? localSelected : remoteSelected;
+    const entries = isLocal ? local?.entries || [] : remote;
+    if (
+      !selected.length ||
+      busy ||
+      (type === "rename" && selected.length !== 1)
+    )
+      return;
+    const first = entries.find((f) => f.path === selected[0]);
+    if (first)
+      setOperation({
+        type,
+        local: isLocal,
+        paths: [...selected],
+        path: first.path,
+        value: selected.length === 1 ? first.name : `${selected.length} items`,
+      });
+  }
+  function browserKey(
+    e: KeyboardEvent,
+    entries: FileEntry[],
+    isLocal: boolean,
+  ) {
+    if (
+      (e.target as HTMLElement).closest("input, textarea, select, button") ||
+      pending ||
+      operation ||
+      edit
+    )
+      return;
+    const selected = isLocal ? localSelected : remoteSelected;
+    const update = isLocal ? setLocalSelected : setRemoteSelected;
+    const index = Math.max(
+      0,
+      entries.findIndex((f) => f.path === selected[selected.length - 1]),
+    );
+    const focus = (file: FileEntry | undefined) => {
+      if (!file) return;
+      update([file.path]);
+      anchor.current[isLocal ? "local" : "remote"] = file.path;
+      const list = e.currentTarget;
+      requestAnimationFrame(() => {
+        const row = [
+          ...list.querySelectorAll<HTMLElement>("[role=option]"),
+        ].find((r) => r.dataset.path === file.path);
+        row?.focus();
+        row?.scrollIntoView({ block: "nearest" });
+      });
+    };
+    if (e.key === "Delete") {
+      e.preventDefault();
+      requestOperation("delete", isLocal);
+    } else if (e.key === "F2") {
+      e.preventDefault();
+      requestOperation("rename", isLocal);
+    } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a") {
+      e.preventDefault();
+      update(entries.map((f) => f.path));
+    } else if (e.key === "Enter") {
+      const file = entries[index];
+      if (file?.directory) {
+        e.preventDefault();
+        void (isLocal ? loadLocal(file.path) : loadRemote(file.path));
+      }
+    } else if (["ArrowDown", "ArrowUp", "Home", "End"].includes(e.key)) {
+      e.preventDefault();
+      focus(
+        entries[
+          e.key === "Home"
+            ? 0
+            : e.key === "End"
+              ? entries.length - 1
+              : Math.max(
+                  0,
+                  Math.min(
+                    entries.length - 1,
+                    index + (e.key === "ArrowDown" ? 1 : -1),
+                  ),
+                )
+        ],
+      );
+    } else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      e.preventDefault();
+      const side = isLocal ? "local" : "remote",
+        previous = typeahead.current;
+      const key = e.key.toLocaleLowerCase();
+      const repeated = previous.side === side && previous.text === key;
+      const text =
+        previous.side === side && Date.now() - previous.time < 900 && !repeated
+          ? previous.text + key
+          : key;
+      typeahead.current = { side, text, time: Date.now() };
+      const start = text.length === 1 ? index + 1 : index;
+      const ordered = [...entries.slice(start), ...entries.slice(0, start)];
+      focus(ordered.find((f) => f.name.toLocaleLowerCase().startsWith(text)));
+    }
+  }
+  function remoteTarget(x: number, y: number) {
+    const hit = document.elementFromPoint(x, y);
+    if (
+      hit?.closest(".remote-browser") !== remoteElement.current ||
+      !snapshot.current.id ||
+      snapshot.current.blocked
+    )
+      return null;
+    return (
+      hit?.closest<HTMLElement>("[data-remote-directory]")?.dataset
+        .remoteDirectory || snapshot.current.path
+    );
+  }
+  function beginLocalDrag(
+    e: ReactPointerEvent<HTMLDivElement>,
+    file: FileEntry,
+  ) {
+    if (e.button !== 0 || !id || file.symlink) return;
+    internalDrag.current = {
+      x: e.clientX,
+      y: e.clientY,
+      paths: localSelected.includes(file.path)
+        ? [...localSelected]
+        : [file.path],
+      moved: false,
+      pointer: e.pointerId,
+      element: e.currentTarget,
+    };
+    // Native WebView2 file-drop interception prevents HTML5 internal drag/drop.
+    e.currentTarget.setPointerCapture(e.pointerId);
+  }
+  function moveLocalDrag(e: ReactPointerEvent<HTMLDivElement>) {
+    const d = internalDrag.current;
+    if (!d || d.pointer !== e.pointerId) return;
+    if (!d.moved && Math.hypot(e.clientX - d.x, e.clientY - d.y) < 6) return;
+    e.preventDefault();
+    d.moved = true;
+    setDragging(true);
+    setOver(remoteTarget(e.clientX, e.clientY) !== null);
+  }
+  function endLocalDrag(
+    e: ReactPointerEvent<HTMLDivElement>,
+    cancelled = false,
+  ) {
+    const d = internalDrag.current;
+    if (!d) return;
+    internalDrag.current = null;
+    if (d.element.hasPointerCapture(d.pointer))
+      d.element.releasePointerCapture(d.pointer);
+    setOver(false);
+    setDragging(false);
+    if (d.moved) {
+      suppressClick.current = true;
+      const target = !cancelled && remoteTarget(e.clientX, e.clientY);
+      if (target) queue(d.paths, true, target);
+      window.setTimeout(() => {
+        suppressClick.current = false;
+      }, 0);
+    }
+  }
   function rows(entries: FileEntry[], isLocal: boolean) {
     const selected = isLocal ? localSelected : remoteSelected;
     return entries.map((file) => (
       <div
         key={file.path}
+        data-path={file.path}
         role="option"
         aria-selected={selected.includes(file.path)}
         tabIndex={0}
@@ -466,7 +656,11 @@ export default function FilesPane({
         data-remote-directory={
           !isLocal && file.directory ? file.path : undefined
         }
-        draggable={isLocal && !file.symlink}
+        draggable={!desktop && isLocal && !file.symlink}
+        onPointerDown={isLocal ? (e) => beginLocalDrag(e, file) : undefined}
+        onPointerMove={isLocal ? moveLocalDrag : undefined}
+        onPointerUp={isLocal ? (e) => endLocalDrag(e) : undefined}
+        onPointerCancel={isLocal ? (e) => endLocalDrag(e, true) : undefined}
         onDragStart={(e) => {
           if (!isLocal) return;
           e.dataTransfer.setData(
@@ -477,16 +671,8 @@ export default function FilesPane({
           );
           e.dataTransfer.effectAllowed = "copy";
         }}
-        onClick={(e) => select(e, file.path, entries, isLocal)}
-        onKeyDown={(e) => {
-          if (e.key === "Enter" && file.directory)
-            void (isLocal ? loadLocal(file.path) : loadRemote(file.path));
-          if (e.ctrlKey && e.key === "a") {
-            e.preventDefault();
-            (isLocal ? setLocalSelected : setRemoteSelected)(
-              entries.map((f) => f.path),
-            );
-          }
+        onClick={(e) => {
+          if (!suppressClick.current) select(e, file.path, entries, isLocal);
         }}
         onDoubleClick={() => {
           if (file.directory)
@@ -561,7 +747,7 @@ export default function FilesPane({
   }
   return (
     <aside
-      className={`file-manager mode-${mode}`}
+      className={`file-manager mode-${mode} ${dragging ? "internal-dragging" : ""}`}
       style={{
         display: active ? "flex" : "none",
         width: mode === "both" ? width : singleWidth,
@@ -696,6 +882,8 @@ export default function FilesPane({
               className="browser-list"
               role="listbox"
               aria-label="Local directory"
+              tabIndex={0}
+              onKeyDown={(e) => browserKey(e, visibleLocal, true)}
               aria-multiselectable="true"
             >
               {rows(visibleLocal, true)}
@@ -717,7 +905,20 @@ export default function FilesPane({
                 ? `${localSelected.length} selected`
                 : `${visibleLocal.length} items`}
               <span className="spacer" />
-              <span>Ctrl / Shift to select</span>
+              <button
+                title="Rename local item"
+                disabled={localSelected.length !== 1 || busy}
+                onClick={() => requestOperation("rename", true)}
+              >
+                Rename
+              </button>
+              <button
+                title="Delete local items"
+                disabled={!localSelected.length || busy}
+                onClick={() => requestOperation("delete", true)}
+              >
+                <Trash2 size={13} />
+              </button>
             </div>
           </section>
         )}
@@ -810,6 +1011,8 @@ export default function FilesPane({
               className="browser-list"
               role="listbox"
               aria-label="Remote directory"
+              tabIndex={0}
+              onKeyDown={(e) => browserKey(e, visibleRemote, false)}
               aria-multiselectable="true"
             >
               {id ? (
@@ -853,31 +1056,15 @@ export default function FilesPane({
               </button>
               <button
                 title="Rename remote item"
-                disabled={
-                  !selectedRemote || remoteSelected.length !== 1 || busy
-                }
-                onClick={() =>
-                  setOperation({
-                    type: "rename",
-                    path: selectedRemote!.path,
-                    value: selectedRemote!.name,
-                  })
-                }
+                disabled={remoteSelected.length !== 1 || busy}
+                onClick={() => requestOperation("rename", false)}
               >
                 Rename
               </button>
               <button
                 title="Delete remote item"
-                disabled={
-                  !selectedRemote || remoteSelected.length !== 1 || busy
-                }
-                onClick={() =>
-                  setOperation({
-                    type: "delete",
-                    path: selectedRemote!.path,
-                    value: selectedRemote!.name,
-                  })
-                }
+                disabled={!remoteSelected.length || busy}
+                onClick={() => requestOperation("delete", false)}
               >
                 <Trash2 size={13} />
               </button>
@@ -915,14 +1102,20 @@ export default function FilesPane({
           <div>
             <strong>
               {progress.status === "completed"
-                ? "Transfer complete"
+                ? progress.completedFiles === 0 && progress.skippedFiles > 0
+                  ? "No files transferred — all items skipped"
+                  : progress.skippedFiles > 0
+                    ? "Transfer finished with skipped files"
+                    : "Transfer complete — verified"
                 : progress.status === "cancelled"
                   ? "Transfer cancelled"
                   : progress.status === "failed"
                     ? "Transfer failed"
                     : progress.status === "planning"
                       ? "Preparing transfer…"
-                      : "Transferring…"}
+                      : progress.status === "verifying"
+                        ? "Verifying server contents…"
+                        : "Transferring…"}
             </strong>
             <span className="spacer" />
             {busy && (
@@ -1025,14 +1218,17 @@ export default function FilesPane({
           >
             <h2>
               {operation.type === "delete"
-                ? "Delete remote item?"
+                ? `Delete ${operation.local ? "local" : "remote"} ${operation.paths && operation.paths.length > 1 ? "items" : "item"}?`
                 : operation.type === "mkdir"
                   ? "New folder"
                   : "Rename item"}
             </h2>
             {operation.type === "delete" ? (
               <p>
-                Permanently delete “{operation.value}”? Folders must be empty.
+                Permanently delete “{operation.value}”?{" "}
+                {operation.local
+                  ? "Folders and their contents will be deleted."
+                  : "Remote folders must be empty."}
               </p>
             ) : (
               <label>
@@ -1054,10 +1250,11 @@ export default function FilesPane({
               <button
                 className={operation.type === "delete" ? "danger" : "primary"}
                 disabled={
-                  !operation.value.trim() ||
-                  operation.value === "." ||
-                  operation.value === ".." ||
-                  /[\\/]/.test(operation.value)
+                  operation.type !== "delete" &&
+                  (!operation.value.trim() ||
+                    operation.value === "." ||
+                    operation.value === ".." ||
+                    /[\\/]/.test(operation.value))
                 }
               >
                 Confirm

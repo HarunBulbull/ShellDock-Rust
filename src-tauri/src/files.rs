@@ -80,6 +80,50 @@ pub async fn list_local(path: Option<String>) -> Result<LocalDirectory> {
     .await
 }
 
+fn local_operation(action: &str, paths: &[String], name: Option<&str>) -> Result<()> {
+    if paths.is_empty() {
+        return Err("Select an item.".into());
+    }
+    if action == "rename" && paths.len() != 1 {
+        return Err("Select one item to rename.".into());
+    }
+    for value in paths {
+        let path = Path::new(value);
+        if !path.is_absolute() || path.parent().is_none() || path.file_name().is_none() {
+            return Err("A filesystem root cannot be changed.".into());
+        }
+        let metadata = fs::symlink_metadata(path).map_err(err)?;
+        match action {
+            "rename" => {
+                let name = name.ok_or("Name required.")?;
+                download_name(name)?;
+                let destination = path.with_file_name(name);
+                if destination == path {
+                    continue;
+                }
+                if fs::symlink_metadata(&destination).is_ok() {
+                    return Err("An item with this name already exists.".into());
+                }
+                fs::rename(path, destination).map_err(err)?;
+            }
+            "delete" => {
+                // remove_dir_all does not traverse directory symlinks/junctions.
+                if metadata.is_dir() {
+                    fs::remove_dir_all(path).map_err(err)?;
+                } else {
+                    fs::remove_file(path).map_err(err)?;
+                }
+            }
+            _ => return Err("Unsupported local operation.".into()),
+        }
+    }
+    Ok(())
+}
+#[tauri::command]
+pub async fn local_action(action: String, paths: Vec<String>, name: Option<String>) -> Result<()> {
+    blocking(move || local_operation(&action, &paths, name.as_deref())).await
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BatchRequest {
@@ -331,6 +375,38 @@ fn commit_remote(sftp: &Sftp, temp: &str, destination: &str, replace_existing: b
     })
 }
 
+fn verify_upload(sftp: &Sftp, item: &Item, cancel: &AtomicBool) -> Result<()> {
+    let mut local = fs::File::open(&item.local).map_err(err)?;
+    let mut remote = sftp.open(Path::new(&item.remote)).map_err(err)?;
+    let mut left = [0; 65536];
+    let mut right = [0; 65536];
+    let mut total = 0;
+    loop {
+        check(cancel)?;
+        let n = local.read(&mut left).map_err(err)?;
+        if n == 0 {
+            break;
+        }
+        remote
+            .read_exact(&mut right[..n])
+            .map_err(|e| format!("Upload verification failed for {}: {e}", item.remote))?;
+        if left[..n] != right[..n] {
+            return Err(format!(
+                "Upload verification failed: server contents differ at {}",
+                item.remote
+            ));
+        }
+        total += n as u64;
+    }
+    if total != item.size || remote.read(&mut right[..1]).map_err(err)? != 0 {
+        return Err(format!(
+            "Upload verification failed: file size changed at {}",
+            item.remote
+        ));
+    }
+    Ok(())
+}
+
 pub fn run_batch(
     ctx: &Context,
     request: &BatchRequest,
@@ -469,6 +545,12 @@ pub fn run_batch(
                     let _ = sftp.unlink(Path::new(&temp));
                 }
                 copied?;
+                // A successful write/rename response alone is not proof that the
+                // requested destination contains the bytes that were selected.
+                state.status = "verifying".into();
+                report(&state);
+                verify_upload(&sftp, item, cancel)?;
+                state.status = "transferring".into();
             } else {
                 if let Ok(metadata) = fs::symlink_metadata(&item.local) {
                     if linked(&metadata) || !metadata.is_file() {
@@ -580,5 +662,35 @@ mod tests {
         for value in ["..", ".", "a/b", "a\\b", ""] {
             assert!(validate_name(value).is_err());
         }
+    }
+    #[test]
+    fn local_rename_and_recursive_delete_keep_other_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.txt");
+        let kept = dir.path().join("keep.txt");
+        fs::write(&first, b"rename contents").unwrap();
+        fs::write(&kept, b"do not overwrite").unwrap();
+        let paths = vec![first.to_string_lossy().into_owned()];
+        assert!(local_operation("rename", &paths, Some("keep.txt")).is_err());
+        assert!(local_operation("rename", &paths, Some("../escape.txt")).is_err());
+        local_operation("rename", &paths, Some("renamed.txt")).unwrap();
+        let renamed = dir.path().join("renamed.txt");
+        assert_eq!(fs::read(&renamed).unwrap(), b"rename contents");
+        let folder = dir.path().join("nested");
+        fs::create_dir(&folder).unwrap();
+        fs::write(folder.join("child.txt"), b"child").unwrap();
+        local_operation(
+            "delete",
+            &[
+                renamed.to_string_lossy().into(),
+                folder.to_string_lossy().into(),
+            ],
+            None,
+        )
+        .unwrap();
+        assert!(!renamed.exists());
+        assert!(!folder.exists());
+        assert_eq!(fs::read(kept).unwrap(), b"do not overwrite");
+        assert!(local_operation("delete", &[String::from("C:\\")], None).is_err());
     }
 }
