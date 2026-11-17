@@ -26,7 +26,11 @@ Aktif oturum bağlamında sır `Zeroizing<String>` ile tutulur; SFTP yeniden ba�
 
 ## Veri güvenilirliği
 
-İlk transfer uygulaması mevcut hedefi exclusive create ile korur. Dosya aktarım hatası kısmi hedef bırakabilir; UI bunu belirtir. Klasör ve symlink transferi etkin değildir. Sonraki transfer altyapısı geçici hedef, doğrulama, atomik tamamlama, iptal, yeniden deneme ve kalıcı kuyruk içermelidir.
+v0.2.0 dosya yöneticisi `files.rs` içindeki batch motorunu kullanır. Seçilen köklerden rekürsif plan çıkarılır; iç içe ve boş klasörler korunur. Bağlantılar/junctionlar takip edilmez. Dosyalar önce aynı hedef klasörde benzersiz gizli `.part` dosyasına yazılır. Skip mevcut hedefi korur. SFTP v3 Replace için önce eski hedef yedeğe taşınır; yeni dosya yerleştirilemezse yedek geri yüklenir. Bu işlem atomik değildir; geri alma da başarısız olursa korunmuş yedeğin yolu hata mesajında gösterilir. Normal hata/iptalde staging dosyası temizlenir; zorla kapanma için garanti yoktur.
+
+React paneli oturum başına bellekte sıralı kuyruk tutar. Sekme/panel gizlenmesi paneli unmount etmez; iş ve kuyruk korunur. Oturum kapatma/değiştirme iptal tokenını ayarlar ve bekleyen işleri temizler. İptal worker tarafından planlama, dosya ve blok sınırlarında kontrol edilir; bloklayan ağ çağrısının timeout'una kadar gecikebilir. Kuyruk kalıcı değildir; pause/resume/retry henüz yoktur.
+
+Explorer girişleri `tauri://drag-*` olaylarından gerçek dosya yollarını alır; fiziksel koordinatlar cihaz piksel oranıyla CSS koordinatlarına çevrilir. Hedef görünür uzak panel veya imlecin altındaki uzak klasördür. Yerel panel iç sürükleme için özel bir DOM veri türü kullanır. İki yol da aynı onay ve transfer motoruna gider.
 
 Uzak düzenleyici 2 MB UTF-8 sınırındadır. Kaydetme açık kullanıcı onaylıdır, doğrudan truncate/write yapar. Atomik kayıt ve uzak sürüm çatışması denetimi tamamlanmadan kritik dosyalar için güvenilirlik iddiası yapılmaz.
 
@@ -34,7 +38,7 @@ Uzak düzenleyici 2 MB UTF-8 sınırındadır. Kaydetme açık kullanıcı onayl
 
 Arayüz testleri gerçek Chromium + taklit Tauri IPC kullanır. Host güven kararı olmadan `connect` çağrılmadığını, sekme bağımsızlığını ve SFTP seçimini denetler; tarayıcı hatalarını başarısız sayar.
 
-Rust testlerindeki Node SSH fixture loopback'te rastgele port açar; RSA/Ed25519 anahtarları ve SFTP dosyaları geçicidir. Gerçek libssh2 bağlantısı, PTY, Unicode dosya aktarımı, hedef çatışması, rename/delete ve yanlış host key reddi test edilir. Şifreli RSA ve Ed25519 kullanıcı anahtarları, yanlış parola/passphrase reddi ve Windows Credential Manager roundtrip/silme de kapsamdadır. Altı test Windows üzerinde geçti.
+Rust testlerindeki Node SSH fixture loopback'te rastgele port açar; RSA/Ed25519 anahtarları ve SFTP dosyaları geçicidir. SSH/credential testlerine ek olarak batch yükleme/indirme, boş ve iç içe klasörler, Skip/Replace, iptal temizliği ve sunucunun rename hatasında rollback doğrulanır. Sekiz Rust testi Windows üzerinde geçti.
 
 Gerçek optimize `.exe`, geçici loopback CDP portuyla Playwright üzerinden açıldı; WebView2 içeriği, Rust IPC ve bağlantı formu doğrulandı. Ayrı OpenSSL DLL bağımlılığı bulunmadığı PE import tablosundan kontrol edildi. NSIS x64 kurulumu üretildi; kurulum/kaldırma sihirbazı henüz denenmedi. İlk yerel release paketinde aynı kaynak sürümünden derlenmiş `/O2` statik OpenSSL kütüphaneleri yeniden kullanıldı; normal `npm run tauri build` gerektiğinde bu kütüphaneleri vendored kaynaklardan derler.
 
@@ -42,6 +46,6 @@ Gerçek optimize `.exe`, geçici loopback CDP portuyla Playwright üzerinden aç
 
 1. OpenSSH üzerinde vim/tmux/Unicode/resize/uzun oturum ve agent testlerini genişlet; mevcut loopback protokol ve credential testlerini koru.
 2. `lib.rs` içindeki taşıma, persistence, credentials ve transferleri bağımsız modüllere ayır; testleri bu servislerin arayüzüne bağla.
-3. İptal edilebilir ve sınırlı paralel transfer motoru, staging ve açık çakışma politikası ekle.
+3. Mevcut sıralı motorun büyük dosya/kesinti/disk doluluğu testlerini genişlet; kalıcı kuyruk ve devam ekle.
 4. Şema migration, tercihler, oturum restorasyonu, erişilebilir modal odak yönetimi ve Türkçe yerelleştirme ekle.
 5. Kaynak projedeki ileri SFTP özellikleri ve Windows entegrasyonunu tamamla; imzalı kurulum dağıtımını ayrı doğrula.

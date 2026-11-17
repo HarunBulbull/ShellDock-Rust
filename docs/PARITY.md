@@ -4,7 +4,7 @@ Kaynak incelemesi: `HarunBulbull/ShellDock`, bu çalışma sırasında `.referen
 
 İncelenen kaynak commit: `acce1c24e8c88d858f2efb3942487e9846eff856`.
 
-**Kodlandı** ifadesi her iş akışının uçtan uca doğrulandığı anlamına gelmez. Windows Rust derlemesi ve altı test geçti; aşağıda doğrulanan ve bekleyen işler ayrıdır.
+**Kodlandı** ifadesi her iş akışının uçtan uca doğrulandığı anlamına gelmez. v0.2.0'da sekiz Rust, yedi arayüz testi ve yalıtılmış gerçek Windows dosya akışı testi geçti; aşağıda doğrulanan ve bekleyen işler ayrıdır.
 
 | Kaynak işlev | Windows durumu | Sonraki doğrulama / iş |
 |---|---|---|
@@ -20,13 +20,13 @@ Kaynak incelemesi: `HarunBulbull/ShellDock`, bu çalışma sırasında `.referen
 | SFTP gezinme | Kodlandı | Büyük dizin ve bağlantı kesintisi |
 | Klasör oluştur / yeniden adlandır / sil | Kodlandı | Yetki ve boş olmayan klasör hataları |
 | Uzak metin düzenleme | İlk sürüm kodlandı | Atomik kayıt ve çatışma algılama |
-| Dosya yükle / indir | İlk sürüm kodlandı | Büyük dosya ve disk doluluğu |
+| Dosya yükle / indir | Çoklu seçim ve rekürsif klasör transferi doğrulandı | Büyük dosya, disk doluluğu, bağlantı kesintisi |
 | Dosya ilerlemesi | Byte düzeyinde kodlandı | Performans ve hız hesabı |
 | Dosya / klasör çoğaltma | Planlandı | İşlem altyapısı |
-| Klasör transfer / merge / conflict policy | Planlandı | Rekürsif planlayıcı ve symlink kuralları |
-| Kuyruk / pause / resume / cancel / retry | Planlandı | Kalıcı iş modeli, iptal tokenları |
-| Yerel + uzak çift panel | Planlandı | Windows dosya sistemi tarayıcısı |
-| Explorer sürükle-bırak | Planlandı | Tauri dosya bırakma ve dışa sürükleme |
+| Klasör transfer / merge / conflict policy | v0.2.0: iç içe ve boş klasörler, Skip/Replace, staging ve rollback test edildi | Büyük ağaçlar ve kesintiler |
+| Kuyruk / pause / resume / cancel / retry | Oturum içi sıra ve iptal var; sekme değişiminde korunur | Kalıcı kuyruk, pause/resume/retry |
+| Yerel + uzak çift panel | v0.2.0: Remote/Local/Both, çoklu seçim, yerel gezinme | Sürücü/favori kısayolları, tercihlerin genişletilmesi |
+| Explorer sürükle-bırak | Çoklu native drop olayı ve yerel panelden uzak klasöre sürükleme test edildi | Fiziksel Explorer fare testi ve Explorer'a dışa sürükleme |
 | SFTP keepalive / otomatik reconnect | Kısmi | SSH keepalive var; SFTP her işte yeniden bağlanır |
 | Uzak recursive search / favori yollar | Planlandı | Bütçeli tarama ve yol deposu |
 | Karşılaştırma / senkronizasyon | Planlandı | Önizlemeli, açık onaylı senkronizasyon planı |
@@ -36,4 +36,4 @@ Kaynak incelemesi: `HarunBulbull/ShellDock`, bu çalışma sırasında `.referen
 | Anonim tanı raporu | Planlandı | Kimlik, yol, çıktı, sır içermeyen rapor |
 | Oturum restorasyonu | Planlandı | Sürümlemeli workspace şeması |
 
-Öncelik: Windows uygulama/paket doğrulaması → güvenilir transfer kuyruğu → klasör / çift panel / senkronizasyon → Explorer entegrasyonu ve dağıtım. İlk yerel Rust derlemesi, loopback protokol ve credential testleri tamamlandı.
+Öncelik: büyük dosya/kesinti testleri → kalıcı kuyruk ve devam → senkronizasyon → dışa sürükleme ve Explorer bağlam menüsü entegrasyonu. Yerel/uzak çift panel ve ilk toplu klasör transferi akışı tamamlandı.

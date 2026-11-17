@@ -1,6 +1,6 @@
 [package]
 name = "shelldock"
-version = "0.1.0"
+version = "0.2.0"
 description = "SSH and SFTP workspace for Windows"
 authors = ["Harun Bulbul"]
 edition = "2021"

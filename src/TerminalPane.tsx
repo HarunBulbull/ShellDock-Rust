@@ -45,7 +45,7 @@ export default function TerminalPane({ connection, active, onSession }: Props) {
         lineHeight: 1.25,
         scrollback: 10000,
         theme: {
-          background: "#101317",
+          background: "#1c1c1e",
           foreground: "#d3d8df",
           cursor: "#71b7ff",
           selectionBackground: "#31567a",

@@ -26,6 +26,7 @@ if (process.argv[3])
   writeFileSync(process.argv[3], modernHost.private, { mode: 0o600 });
 const allowedClientKeys = [publicKey, utils.parseKey(modernHost.private)];
 const files = new Map([["/hello.txt", Buffer.from("Hello from SFTP\n")]]);
+const directories = new Set(["/"]);
 // ssh2's server does not implement DH group exchange. Advertise only implemented
 // modern exchanges so this fixture does not negotiate an unusable server method.
 const server = new Server(
@@ -82,6 +83,7 @@ const server = new Server(
         session.on("sftp", (accept) => {
           const sftp = accept(),
             handles = new Map();
+          sftp.on("end", () => sftp.end());
           let seq = 0;
           const stat = (data) => ({
             mode: 0o100644,
@@ -107,15 +109,33 @@ const server = new Server(
               },
             ]),
           );
+          const directoryStat = {
+            mode: 0o40755,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            atime: 0,
+            mtime: 0,
+          };
+          sftp.on("MKDIR", (id, path) => {
+            if (files.has(path) || directories.has(path))
+              return sftp.status(id, STATUS_CODE.FAILURE);
+            directories.add(path);
+            sftp.status(id, STATUS_CODE.OK);
+          });
           sftp.on("STAT", (id, path) =>
-            files.has(path)
-              ? sftp.attrs(id, stat(files.get(path)))
-              : sftp.status(id, STATUS_CODE.NO_SUCH_FILE),
+            directories.has(path)
+              ? sftp.attrs(id, directoryStat)
+              : files.has(path)
+                ? sftp.attrs(id, stat(files.get(path)))
+                : sftp.status(id, STATUS_CODE.NO_SUCH_FILE),
           );
           sftp.on("LSTAT", (id, path) =>
-            files.has(path)
-              ? sftp.attrs(id, stat(files.get(path)))
-              : sftp.status(id, STATUS_CODE.NO_SUCH_FILE),
+            directories.has(path)
+              ? sftp.attrs(id, directoryStat)
+              : files.has(path)
+                ? sftp.attrs(id, stat(files.get(path)))
+                : sftp.status(id, STATUS_CODE.NO_SUCH_FILE),
           );
           sftp.on("OPEN", (id, path, flags) => {
             if (flags & OPEN_MODE.EXCL && files.has(path))
@@ -157,22 +177,34 @@ const server = new Server(
             handles.delete(handle.readUInt32BE());
             sftp.status(id, STATUS_CODE.OK);
           });
-          sftp.on("OPENDIR", (id) => {
+          sftp.on("OPENDIR", (id, path) => {
+            if (!directories.has(path))
+              return sftp.status(id, STATUS_CODE.NO_SUCH_FILE);
             const handle = Buffer.alloc(4);
             handle.writeUInt32BE(++seq);
-            handles.set(seq, { directory: true, read: false });
+            handles.set(seq, { directory: true, read: false, path });
             sftp.handle(id, handle);
           });
           sftp.on("READDIR", (id, handle) => {
             const h = handles.get(handle.readUInt32BE());
             if (!h || h.read) return sftp.status(id, STATUS_CODE.EOF);
             h.read = true;
+            const prefix = h.path === "/" ? "/" : h.path + "/";
+            const children = [...files.keys(), ...directories].filter(
+              (path) =>
+                path.startsWith(prefix) &&
+                path !== h.path &&
+                !path.slice(prefix.length).includes("/"),
+            );
+            if (!children.length) return sftp.status(id, STATUS_CODE.EOF);
             sftp.name(
               id,
-              [...files.entries()].map(([path, data]) => ({
-                filename: path.slice(1),
-                longname: path.slice(1),
-                attrs: stat(data),
+              children.map((path) => ({
+                filename: path.slice(prefix.length),
+                longname: path,
+                attrs: directories.has(path)
+                  ? directoryStat
+                  : stat(files.get(path)),
               })),
             );
           });
@@ -181,6 +213,9 @@ const server = new Server(
             sftp.status(id, STATUS_CODE.OK);
           });
           sftp.on("RENAME", (id, from, to) => {
+            // Fault injection verifies rollback after a staged replacement fails.
+            if (to === "/__reject_commit.txt" && from.endsWith(".part"))
+              return sftp.status(id, STATUS_CODE.FAILURE);
             if (!files.has(from) || files.has(to))
               return sftp.status(id, STATUS_CODE.FAILURE);
             files.set(to, files.get(from));

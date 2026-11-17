@@ -14,6 +14,7 @@ use std::{
 };
 use tauri::{ipc::Channel, Manager, State};
 use zeroize::Zeroizing;
+mod files;
 
 type Result<T> = std::result::Result<T, String>;
 fn err(e: impl std::fmt::Display) -> String {
@@ -79,6 +80,7 @@ struct Backend {
     store: Mutex<Store>,
     sessions: Arc<Mutex<HashMap<String, Live>>>,
     path: Mutex<PathBuf>,
+    transfers: Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
 }
 fn persist(state: &Backend, store: &Store) -> Result<()> {
     let path = state.path.lock().map_err(err)?;
@@ -657,7 +659,10 @@ pub fn run() {
             remote_action,
             read_remote,
             write_remote,
-            transfer
+            transfer,
+            files::list_local,
+            files::transfer_batch,
+            files::cancel_transfer
         ])
         .build(tauri::generate_context!())
         .expect("Unable to initialize ShellDock")
@@ -795,6 +800,126 @@ mod tests {
         )
         .unwrap();
         sftp.unlink(Path::new("/renamed.txt")).unwrap();
+        // Exercise the production batch engine with nested folders and multiple roots.
+        let source_dir = tempfile::tempdir().unwrap();
+        let folder = source_dir.path().join("project");
+        fs::create_dir_all(folder.join("nested")).unwrap();
+        fs::create_dir(folder.join("empty")).unwrap();
+        fs::write(folder.join("nested/data.txt"), b"batch payload").unwrap();
+        let loose = source_dir.path().join("loose.txt");
+        fs::write(&loose, b"loose").unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let request = files::BatchRequest {
+            job_id: "test-batch".into(),
+            sources: vec![
+                folder.to_string_lossy().into(),
+                loose.to_string_lossy().into(),
+            ],
+            destination: "/".into(),
+            upload: true,
+            policy: "skip".into(),
+        };
+        let uploaded = files::run_batch(&ctx, &request, &cancel, |_| {}).unwrap();
+        assert_eq!(uploaded.completed_files, 2);
+        assert_eq!(uploaded.completed_bytes, 18);
+        assert!(sftp.stat(Path::new("/project/empty")).unwrap().is_dir());
+        let skipped = files::run_batch(&ctx, &request, &cancel, |_| {}).unwrap();
+        assert_eq!(skipped.skipped_files, 2);
+        assert_eq!(skipped.completed_files, 0);
+        let destination = tempfile::tempdir().unwrap();
+        let download = files::BatchRequest {
+            job_id: "download".into(),
+            sources: vec!["/project".into(), "/loose.txt".into()],
+            destination: destination.path().to_string_lossy().into(),
+            upload: false,
+            policy: "skip".into(),
+        };
+        let received = files::run_batch(&ctx, &download, &cancel, |_| {}).unwrap();
+        assert_eq!(received.completed_files, 2);
+        assert_eq!(
+            fs::read(destination.path().join("project/nested/data.txt")).unwrap(),
+            b"batch payload"
+        );
+        assert!(destination.path().join("project/empty").is_dir());
+        fs::write(destination.path().join("loose.txt"), b"keep existing").unwrap();
+        let again = files::run_batch(&ctx, &download, &cancel, |_| {}).unwrap();
+        assert_eq!(again.skipped_files, 2);
+        assert_eq!(
+            fs::read(destination.path().join("loose.txt")).unwrap(),
+            b"keep existing"
+        );
+        let mut replace_download = download.clone();
+        replace_download.policy = "replace".into();
+        assert_eq!(
+            files::run_batch(&ctx, &replace_download, &cancel, |_| {})
+                .unwrap()
+                .completed_files,
+            2
+        );
+        assert_eq!(
+            fs::read(destination.path().join("loose.txt")).unwrap(),
+            b"loose"
+        );
+        fs::write(&loose, b"replacement contents").unwrap();
+        let mut replace_upload = request.clone();
+        replace_upload.policy = "replace".into();
+        assert_eq!(
+            files::run_batch(&ctx, &replace_upload, &cancel, |_| {})
+                .unwrap()
+                .completed_files,
+            2
+        );
+        let mut replaced = String::new();
+        sftp.open(Path::new("/loose.txt"))
+            .unwrap()
+            .read_to_string(&mut replaced)
+            .unwrap();
+        assert_eq!(replaced, "replacement contents");
+        {
+            let mut original = sftp.create(Path::new("/__reject_commit.txt")).unwrap();
+            original.write_all(b"original must survive").unwrap();
+            original.close().unwrap();
+        }
+        let rejected_file = source_dir.path().join("__reject_commit.txt");
+        fs::write(&rejected_file, b"new contents").unwrap();
+        let rejected = files::BatchRequest {
+            job_id: "rollback".into(),
+            sources: vec![rejected_file.to_string_lossy().into()],
+            destination: "/".into(),
+            upload: true,
+            policy: "replace".into(),
+        };
+        assert!(files::run_batch(&ctx, &rejected, &cancel, |_| {})
+            .unwrap_err()
+            .contains("original restored"));
+        let mut original = String::new();
+        sftp.open(Path::new("/__reject_commit.txt"))
+            .unwrap()
+            .read_to_string(&mut original)
+            .unwrap();
+        assert_eq!(original, "original must survive");
+        assert!(!sftp
+            .readdir(Path::new("/"))
+            .unwrap()
+            .iter()
+            .any(|(p, _)| p.to_string_lossy().contains(".backup")
+                || p.to_string_lossy().contains(".part")));
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        assert!(files::run_batch(&ctx, &replace_upload, &stop, |p| {
+            if p.current.ends_with("data.txt") {
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        })
+        .is_err());
+        assert!(!sftp
+            .readdir(Path::new("/project/nested"))
+            .unwrap()
+            .iter()
+            .any(|(p, _)| p.to_string_lossy().contains(".part")));
+        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(files::run_batch(&ctx, &request, &cancel, |_| {})
+            .unwrap_err()
+            .contains("cancelled"));
         ctx.fingerprint = "SHA256:wrong-host-key".into();
         assert!(authenticate(&ctx)
             .err()

@@ -10,17 +10,15 @@ import {
   ChevronRight,
   Folder,
   Settings,
-  Command,
   X,
   PanelRight,
   SquareTerminal,
-  Shield,
-  ArrowUpRight,
   Pencil,
   Trash2,
+  ArrowDownUp,
 } from "lucide-react";
 import TerminalPane from "./TerminalPane";
-import FilesPane from "./FilesPane";
+import FilesPane, { type TransferStatus } from "./FilesPane";
 import type { Connection, SessionTab } from "./types";
 import { desktop, errorText } from "./types";
 const blank = (): Connection => ({
@@ -45,7 +43,12 @@ export default function App() {
     [error, setError] = useState(""),
     [files, setFiles] = useState(true),
     [settings, setSettings] = useState(false),
-    [saving, setSaving] = useState(false);
+    [saving, setSaving] = useState(false),
+    [selectedConnection, setSelectedConnection] = useState("");
+  const [transferInfo, setTransferInfo] = useState<
+      Record<string, TransferStatus>
+    >({}),
+    [showTransfers, setShowTransfers] = useState(false);
   async function reload() {
     if (desktop) setConnections(await invoke<Connection[]>("list_connections"));
   }
@@ -75,6 +78,11 @@ export default function App() {
     setActive(key);
   }
   function close(key: string) {
+    setTransferInfo((previous) => {
+      const next = { ...previous };
+      delete next[key];
+      return next;
+    });
     setTabs((prev) => {
       const next = prev.filter((t) => t.key !== key);
       if (active === key) setActive(next.at(-1)?.key ?? "");
@@ -139,7 +147,7 @@ export default function App() {
           <input
             id="server-search"
             aria-label="Search servers"
-            placeholder="Find a server…"
+            placeholder="Search Servers"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
           />
@@ -169,12 +177,16 @@ export default function App() {
                 )
                 .map((c) => (
                   <div
-                    className={`connection-row ${current?.connection.id === c.id ? "chosen" : ""}`}
+                    className={`connection-row ${(selectedConnection || current?.connection.id) === c.id ? "chosen" : ""}`}
                     key={c.id}
                   >
                     <button
                       className="connection-open"
-                      onClick={() => connect(c)}
+                      onClick={() => setSelectedConnection(c.id)}
+                      onDoubleClick={() => connect(c)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") connect(c);
+                      }}
                     >
                       <Server size={16} />
                       <span>
@@ -219,19 +231,42 @@ export default function App() {
           <button onClick={() => setSettings(true)}>
             <Settings size={16} /> Settings & about
           </button>
-          <span className="small muted">v0.1.0 · Preview</span>
+          <span className="small muted">v0.2.0 · Preview</span>
         </div>
       </aside>
       <main className="main">
         <header className="workspace-header">
           <div>
-            <span className="muted">Workspace</span>
-            <ChevronRight size={14} />
-            <strong>{current?.connection.name ?? "Overview"}</strong>
+            <Terminal size={16} />
+            <strong>{current?.connection.name ?? "ShellDock"}</strong>
           </div>
           <span className="spacer" />
           <button
+            aria-label="Show all transfers"
+            title="Transfers"
+            onClick={() => setShowTransfers(!showTransfers)}
+          >
+            <ArrowDownUp size={16} />
+            <span>Transfers</span>
+            {Object.values(transferInfo).some(
+              (t) =>
+                t.status === "planning" ||
+                t.status === "transferring" ||
+                t.queued > 0,
+            ) && <span className="status-dot online" />}
+          </button>
+          <button
+            title="New connection (Ctrl+N)"
+            onClick={() => setEditing(blank())}
+          >
+            <Plus size={17} />
+          </button>
+          <button title="Settings" onClick={() => setSettings(true)}>
+            <Settings size={17} />
+          </button>
+          <button
             title="Toggle SFTP panel"
+            disabled={!current}
             className={files ? "toggled" : ""}
             onClick={() => setFiles(!files)}
           >
@@ -239,6 +274,58 @@ export default function App() {
             <span>Files</span>
           </button>
         </header>
+        {showTransfers && (
+          <section
+            className="transfers-popover"
+            role="dialog"
+            aria-label="Transfers"
+          >
+            <div className="file-manager-title">
+              <ArrowDownUp size={15} />
+              <strong>Transfers</strong>
+              <span className="spacer" />
+              <button
+                title="Close transfers"
+                onClick={() => setShowTransfers(false)}
+              >
+                <X size={15} />
+              </button>
+            </div>
+            {tabs
+              .filter(
+                (t) =>
+                  transferInfo[t.key]?.status !== "idle" && transferInfo[t.key],
+              )
+              .map((tab) => (
+                <button
+                  className="transfer-summary"
+                  key={tab.key}
+                  onClick={() => {
+                    setActive(tab.key);
+                    setFiles(true);
+                    setShowTransfers(false);
+                  }}
+                >
+                  <Server size={16} />
+                  <span>
+                    <strong>{tab.connection.name}</strong>
+                    <small>
+                      {transferInfo[tab.key].status} ·{" "}
+                      {transferInfo[tab.key].completed}/
+                      {transferInfo[tab.key].total} files
+                      {transferInfo[tab.key].queued
+                        ? ` · ${transferInfo[tab.key].queued} queued`
+                        : ""}
+                    </small>
+                  </span>
+                </button>
+              ))}
+            {!tabs.some(
+              (t) =>
+                transferInfo[t.key] && transferInfo[t.key].status !== "idle",
+            ) && <p>No transfers yet.</p>}
+          </section>
+        )}
         {error && !editing && (
           <div className="error" role="alert">
             {error}
@@ -302,79 +389,30 @@ export default function App() {
                   </div>
                 ))}
               </div>
-              {files && (
-                <FilesPane key={active} id={sessions[active] ?? null} />
-              )}
+              {tabs.map((tab) => (
+                <FilesPane
+                  key={tab.key}
+                  id={sessions[tab.key] ?? null}
+                  active={files && active === tab.key}
+                  onTransfer={(status) =>
+                    setTransferInfo((prev) => ({ ...prev, [tab.key]: status }))
+                  }
+                />
+              ))}
             </div>
           </>
         ) : (
           <div className="welcome">
             <div className="welcome-content">
-              <div className="eyebrow">
-                <span className="status-dot online" /> YOUR SERVERS. ONE
-                WORKSPACE.
-              </div>
-              <div className="welcome-mark">
-                <SquareTerminal size={39} strokeWidth={1.4} />
-              </div>
-              <h1>A place for every connection.</h1>
-              <p className="welcome-description">
-                Keep your servers close. Open a shell, manage files,
-                <br />
-                and get back to building — all from one dock.
+              <SquareTerminal size={46} strokeWidth={1.3} />
+              <h1>Your Remote Workspace</h1>
+              <p>
+                Choose a server in the sidebar, then double-click to open a
+                session.
               </p>
               <button className="primary" onClick={() => setEditing(blank())}>
-                <Plus size={16} /> Add a server <span>Ctrl N</span>
+                New Connection
               </button>
-              <div className="welcome-features">
-                <div>
-                  <Terminal size={20} />
-                  <h3>A proper terminal</h3>
-                  <p>
-                    Interactive SSH sessions.
-                    <br />
-                    Multiple tabs, zero clutter.
-                  </p>
-                </div>
-                <div>
-                  <Folder size={20} />
-                  <h3>Files alongside</h3>
-                  <p>
-                    Browse remote directories.
-                    <br />
-                    Upload, download and edit.
-                  </p>
-                </div>
-                <div>
-                  <Shield size={20} />
-                  <h3>Trust comes first</h3>
-                  <p>
-                    Explicit host verification.
-                    <br />
-                    Windows credential storage.
-                  </p>
-                </div>
-              </div>
-              {connections.length > 0 && (
-                <div className="recent">
-                  <div className="section-label">QUICK CONNECT</div>
-                  {connections.slice(0, 3).map((c) => (
-                    <button key={c.id} onClick={() => connect(c)}>
-                      <Server size={16} />
-                      <span>
-                        {c.name}
-                        <small>{c.host}</small>
-                      </span>
-                      <ArrowUpRight size={16} />
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
-            <div className="welcome-bottom">
-              <Command size={14} /> <span>Ctrl K to find a server</span>
-              <span>·</span>
-              <span>Ctrl N for a new connection</span>
             </div>
           </div>
         )}
@@ -413,7 +451,7 @@ export default function App() {
                     ? "Edit connection"
                     : "New connection"}
                 </h2>
-                <p className="muted">A new home for your server.</p>
+                <p className="muted">Connection details and authentication.</p>
               </div>
               <button
                 type="button"
@@ -584,7 +622,7 @@ export default function App() {
             className="modal narrow"
           >
             <h2>ShellDock for Windows</h2>
-            <p>Version 0.1.0 · Development preview</p>
+            <p>Version 0.2.0 · Development preview</p>
             <p className="muted">Tauri 2 · React · Rust · libssh2 · xterm.js</p>
             <p>
               Host keys are pinned per host and port. Saved passwords and key
@@ -592,10 +630,10 @@ export default function App() {
               connection removes its credential.
             </p>
             <p>
-              This first version supports SSH tabs, SFTP browsing, file
-              transfers, folder creation, rename, delete and text editing.
-              Advanced transfer queues and folder synchronization are still in
-              development.
+              Local and remote file browsers support multi-selection, file and
+              folder transfers, Explorer drops, an in-session transfer queue and
+              cancellation. Folder synchronization and persistent resume are
+              still in development.
             </p>
             <div className="actions">
               <button onClick={() => setSettings(false)}>Close</button>

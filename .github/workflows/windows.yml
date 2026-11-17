@@ -26,7 +26,18 @@ jobs:
       - run: npx playwright install chromium
       - run: npx playwright test
       - run: npm run tauri build
+      - name: Ensure WebView2 Runtime for native tests
+        shell: pwsh
+        run: ./scripts/setup-webview2.ps1
       - run: npm run test:desktop
+      - name: Build isolated native file-test profile
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path .tools | Out-Null
+          $identifier = 'com.harunbulbul.shelldock.smoke.' + [Guid]::NewGuid().ToString('N')
+          @{identifier=$identifier} | ConvertTo-Json | Set-Content -Encoding utf8 .tools/smoke-config.json
+          npm run tauri build -- --no-bundle --config .tools/smoke-config.json
+      - run: node scripts/smoke-files.cjs src-tauri/target/release/shelldock.exe
       - uses: actions/upload-artifact@v4
         with:
           name: ShellDock-Windows
