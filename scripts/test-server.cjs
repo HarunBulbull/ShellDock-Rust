@@ -215,9 +215,23 @@ const server = new Server(
             );
           });
           sftp.on("REMOVE", (id, path) => {
+            if (!files.has(path))
+              return sftp.status(id, STATUS_CODE.NO_SUCH_FILE);
             files.delete(path);
             sftp.status(id, STATUS_CODE.OK);
           });
+          sftp.on("RMDIR", (id, path) => {
+            if (!directories.has(path) || path === "/")
+              return sftp.status(id, STATUS_CODE.FAILURE);
+            const prefix = path + "/";
+            const hasChildren = [...files.keys(), ...directories].some((p) =>
+              p.startsWith(prefix),
+            );
+            if (hasChildren) return sftp.status(id, STATUS_CODE.FAILURE);
+            directories.delete(path);
+            sftp.status(id, STATUS_CODE.OK);
+          });
+          sftp.on("SETSTAT", (id) => sftp.status(id, STATUS_CODE.OK));
           sftp.on("RENAME", (id, from, to) => {
             // Fault injection verifies rollback after a staged replacement fails.
             if (to === "/__reject_commit.txt" && from.endsWith(".part"))

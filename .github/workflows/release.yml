@@ -1,0 +1,95 @@
+name: Release Windows
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.2.2)"
+        required: true
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: npm ci
+      - run: npm run setup:perl
+      - run: npm run build
+      - run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+      - run: npm run test:rust
+      - run: node scripts/run-cargo.cjs clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+      - run: npx playwright install chromium
+      - run: npx playwright test
+      - run: npm run tauri build
+      - name: Prepare release assets
+        shell: pwsh
+        run: |
+          $tag = if ("${{ inputs.tag }}") { "${{ inputs.tag }}" } else { "${{ github.ref_name }}" }
+          $ver = $tag.TrimStart('v')
+          $outDir = "release-assets"
+          $portable = "$outDir/portable"
+          New-Item -ItemType Directory -Force -Path "$portable/licenses" | Out-Null
+          Copy-Item "src-tauri/target/release/shelldock.exe" "$portable/ShellDock.exe"
+          Copy-Item "src-tauri/target/release/shelldock.exe" "$outDir/ShellDock_${ver}_windows-x64.exe"
+          Copy-Item "src-tauri/target/release/bundle/nsis/ShellDock_${ver}_x64-setup.exe" "$outDir/ShellDock_${ver}_x64-setup.exe"
+          Copy-Item "licenses/*" "$portable/licenses/"
+          Copy-Item "LICENSE" "$portable/licenses/ShellDock.txt"
+          Copy-Item "THIRD_PARTY_NOTICES.md" "$portable/licenses/THIRD_PARTY_NOTICES.md"
+          @(
+            "ShellDock for Windows $ver Preview"
+            "Extract this entire ZIP and run ShellDock.exe."
+            "Requires Windows 10/11 x64 and Microsoft Edge WebView2 Runtime."
+            "Close older ShellDock windows before starting this version."
+            "Licenses are in the licenses folder."
+          ) | Set-Content -Encoding utf8 "$portable/README.txt"
+          Compress-Archive -Path "$portable/*" -DestinationPath "$outDir/ShellDock_${ver}_windows-x64.zip" -Force
+          $files = @(
+            "ShellDock_${ver}_windows-x64.exe"
+            "ShellDock_${ver}_windows-x64.zip"
+            "ShellDock_${ver}_x64-setup.exe"
+          )
+          $sums = foreach ($f in $files) {
+            $h = (Get-FileHash "$outDir/$f" -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$h  $f"
+          }
+          $sums | Set-Content -Encoding ascii "$outDir/SHA256SUMS.txt"
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = if ("${{ inputs.tag }}") { "${{ inputs.tag }}" } else { "${{ github.ref_name }}" }
+          $ver = $tag.TrimStart('v')
+          $notesFile = "docs/RELEASE_NOTES_${tag}.md"
+          $notesFlag = if (Test-Path $notesFile) { @("--notes-file", $notesFile) } else { @("--generate-notes") }
+          $assets = @(
+            "release-assets/ShellDock_${ver}_x64-setup.exe"
+            "release-assets/ShellDock_${ver}_windows-x64.zip"
+            "release-assets/ShellDock_${ver}_windows-x64.exe"
+            "release-assets/SHA256SUMS.txt"
+          )
+          $ErrorActionPreference = "Continue"
+          $PSNativeCommandUseErrorActionPreference = $false
+          gh release view $tag *> $null
+          $exists = $LASTEXITCODE -eq 0
+          $ErrorActionPreference = "Stop"
+          if ($exists) {
+            gh release upload $tag @assets --clobber
+          } else {
+            gh release create $tag @assets --title "ShellDock for Windows $tag - Preview" @notesFlag
+          }
+          if ($LASTEXITCODE -ne 0) {
+            throw "GitHub release publish failed with exit code $LASTEXITCODE"
+          }

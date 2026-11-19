@@ -51,6 +51,7 @@ async function main() {
     },
   });
   let browser;
+  let page;
   let launchError;
   app.on("error", (error) => {
     launchError = error;
@@ -70,7 +71,6 @@ async function main() {
       await delay(250);
     }
     browser = await chromium.connectOverCDP(`http://127.0.0.1:${port}`);
-    let page;
     for (let i = 0; i < 150; i++) {
       page = browser
         .contexts()[0]
@@ -113,11 +113,14 @@ async function main() {
       notes: "Disposable local fixture",
       favorite: false,
     };
-    await page.evaluate(
-      (connection) =>
-        window.__TAURI_INTERNALS__.invoke("save_connection", { connection }),
-      connection,
-    );
+    await page.evaluate(async (connection) => {
+      await window.__TAURI_INTERNALS__
+        .invoke("delete_credential", { id: connection.id })
+        .catch(() => {});
+      await window.__TAURI_INTERNALS__.invoke("save_connection", {
+        connection,
+      });
+    }, connection);
     await page.reload();
     await page
       .getByRole("navigation")
@@ -270,11 +273,55 @@ async function main() {
     await expect(local.getByRole("option")).toHaveCount(0);
     await assert.rejects(access(join(destination, "renamed.txt")));
     await assert.rejects(access(join(destination, "project")));
+    // Verify real WebView2 Remote -> Local pointer drag-and-drop.
+    await remote.getByRole("option", { name: /first.txt/ }).dragTo(local);
+    await expect(
+      page.getByRole("heading", { name: "Download 1 item", exact: true }),
+    ).toBeVisible();
+    await page.getByRole("button", { name: "Start download" }).click();
+    await expect(
+      local.getByRole("option", { name: /first.txt/ }),
+    ).toBeVisible();
+    // Verify double-click remote editor + Ctrl+S save in real WebView2 + SFTP.
+    await remote.getByRole("option", { name: /first.txt/ }).dblclick();
+    const editor = page.getByRole("region", {
+      name: "Remote editor for first.txt",
+    });
+    await expect(editor).toBeVisible();
+    await editor.locator(".cm-content").click();
+    await page.keyboard.type("\nedited-in-native");
+    await page.keyboard.press("Control+s");
+    await expect(editor.getByText("Synced with server")).toBeVisible();
+    await editor.getByRole("button", { name: "Close file" }).click();
+    // Verify remote recursive bulk delete removes nested folders and files in one batch.
+    await remote.getByRole("option", { name: /first.txt/ }).click();
+    await remote
+      .getByRole("option", { name: /project/ })
+      .click({ modifiers: ["Control"] });
+    await page.keyboard.press("Delete");
+    await expect(
+      page.getByRole("heading", { name: "Delete remote items?" }),
+    ).toBeVisible();
+    await page.getByRole("button", { name: "Confirm", exact: true }).click();
+    await expect(remote.getByRole("option", { name: /project/ })).toHaveCount(
+      0,
+    );
+    await expect(remote.getByRole("option", { name: /first.txt/ })).toHaveCount(
+      0,
+    );
     assert.deepEqual(errors, []);
     console.log(
-      "PASS: native drop, multi-root upload, overwrite bytes, pointer drag, nested downloads, typeahead, F2 rename, Delete and transfer summary.",
+      "PASS: native drop, multi-root upload, overwrite bytes, two-way pointer drag, remote editor, recursive remote bulk delete, typeahead, F2 rename, Delete and transfer summary.",
     );
   } finally {
+    if (page)
+      await page
+        .evaluate(() =>
+          window.__TAURI_INTERNALS__
+            .invoke("delete_credential", { id: "native-file-fixture" })
+            .catch(() => {}),
+        )
+        .catch(() => {});
     if (browser) await browser.close();
     app.kill();
     ssh.kill();

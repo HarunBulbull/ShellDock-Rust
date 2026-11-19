@@ -1,5 +1,6 @@
 import {
   useEffect,
+  useMemo,
   useRef,
   useState,
   type MouseEvent,
@@ -11,32 +12,40 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
+  ArrowLeft,
+  ArrowRight,
   ArrowUp,
-  RefreshCw,
-  FolderPlus,
-  Upload,
-  Download,
-  Folder,
-  File,
-  Pencil,
-  Trash2,
-  Home,
-  X,
-  FolderOpen,
-  Search,
-  Eye,
+  CheckSquare,
   Columns2,
+  Copy,
+  Download,
+  ExternalLink,
+  File,
+  FilePlus,
+  Folder,
+  FolderOpen,
+  FolderPlus,
+  Home,
   Laptop,
+  Pencil,
+  RefreshCw,
+  Search,
   Server,
+  Shield,
+  Trash2,
+  Upload,
+  X,
+  Eye,
 } from "lucide-react";
-import type { FileEntry } from "./types";
-import { desktop, errorText } from "./types";
+import type {
+  DeleteBatchResult,
+  FileEntry,
+  LocalDirectory,
+  LocalPlaces,
+  RemoteDirectory,
+} from "./types";
+import { desktop, errorText, formatOctalPermissions } from "./types";
 
-interface LocalDirectory {
-  path: string;
-  parent: string | null;
-  entries: FileEntry[];
-}
 interface Progress {
   completedBytes: number;
   totalBytes: number;
@@ -45,12 +54,15 @@ interface Progress {
   skippedFiles: number;
   current: string;
   status: string;
+  bytesPerSec?: number;
 }
+
 interface Pending {
   sources: string[];
   destination: string;
   upload: boolean;
 }
+
 export interface TransferStatus {
   status: string;
   completed: number;
@@ -58,14 +70,37 @@ export interface TransferStatus {
   queued: number;
   skipped: number;
 }
-const join = (base: string, name: string) =>
+
+type SortKey = "name" | "size" | "modified";
+interface SortState {
+  key: SortKey;
+  asc: boolean;
+}
+
+interface ContextMenuState {
+  x: number;
+  y: number;
+  isLocal: boolean;
+  file: FileEntry | null;
+}
+
+const joinRemote = (base: string, name: string) =>
   `${base.replace(/\/$/, "")}/${name}`;
+
+const parentRemote = (current: string) => {
+  if (!current || current === "/" || current === ".") return "/";
+  return current.replace(/\/[^/]+\/?$/, "") || "/";
+};
+
 const bytes = (n: number) =>
   n < 1024
     ? `${n} B`
     : n < 1048576
       ? `${(n / 1024).toFixed(1)} KB`
-      : `${(n / 1048576).toFixed(1)} MB`;
+      : n < 1073741824
+        ? `${(n / 1048576).toFixed(1)} MB`
+        : `${(n / 1073741824).toFixed(2)} GB`;
+
 const empty: Progress = {
   completedBytes: 0,
   totalBytes: 0,
@@ -74,73 +109,193 @@ const empty: Progress = {
   skippedFiles: 0,
   current: "",
   status: "idle",
+  bytesPerSec: 0,
 };
-const dragType = "application/x-shelldock-local-paths";
+
+const dragTypeLocal = "application/x-shelldock-local-paths";
+const dragTypeRemote = "application/x-shelldock-remote-paths";
+
+const BINARY_EXTENSIONS = new Set([
+  "png",
+  "jpg",
+  "jpeg",
+  "gif",
+  "webp",
+  "bmp",
+  "ico",
+  "pdf",
+  "zip",
+  "tar",
+  "gz",
+  "tgz",
+  "bz2",
+  "xz",
+  "7z",
+  "rar",
+  "exe",
+  "dll",
+  "so",
+  "dylib",
+  "bin",
+  "iso",
+  "mp3",
+  "mp4",
+  "mkv",
+  "avi",
+  "mov",
+  "wav",
+  "woff",
+  "woff2",
+  "ttf",
+  "otf",
+  "db",
+  "sqlite",
+]);
+
+function isLikelyBinary(name: string): boolean {
+  const lower = name.toLowerCase();
+  const ext = lower.includes(".") ? (lower.split(".").pop() ?? "") : "";
+  return BINARY_EXTENSIONS.has(ext);
+}
+
+function sortEntries(entries: FileEntry[], sort: SortState): FileEntry[] {
+  const factor = sort.asc ? 1 : -1;
+  return [...entries].sort((a, b) => {
+    if (a.directory !== b.directory) return a.directory ? -1 : 1;
+    if (sort.key === "size") {
+      return (a.size - b.size) * factor || a.name.localeCompare(b.name);
+    }
+    if (sort.key === "modified") {
+      return (a.modified - b.modified) * factor || a.name.localeCompare(b.name);
+    }
+    return a.name.toLowerCase().localeCompare(b.name.toLowerCase()) * factor;
+  });
+}
 
 export default function FilesPane({
   id,
   active = true,
+  refreshToken = 0,
   onTransfer,
+  onOpenEditor,
+  onOpenExternal,
 }: {
   id: string | null;
   active?: boolean;
+  refreshToken?: number;
   onTransfer?: (status: TransferStatus) => void;
+  onOpenEditor?: (path: string) => void;
+  onOpenExternal?: (path: string) => void;
 }) {
   const [mode, setMode] = useState<"remote" | "local" | "both">(() => {
     const saved = localStorage.getItem("files.mode");
     return saved === "local" || saved === "remote" ? saved : "both";
   });
   const [width, setWidth] = useState(
-    () => Number(localStorage.getItem("files.width")) || 680,
+    () => Number(localStorage.getItem("files.width")) || 560,
   );
   const [singleWidth, setSingleWidth] = useState(
     () => Number(localStorage.getItem("files.singleWidth")) || 340,
   );
   const [queuedCount, setQueuedCount] = useState(0);
-  const queued = useRef<{ batch: Pending; policy: "skip" | "replace" }[]>([]),
+  const queued = useRef<
+      { batch: Pending; policy: "skip" | "replace"; verify: boolean }[]
+    >([]),
     localRequest = useRef(0),
     remoteRequest = useRef(0);
   const [local, setLocal] = useState<LocalDirectory | null>(null),
+    [places, setPlaces] = useState<LocalPlaces | null>(null),
     [remote, setRemote] = useState<FileEntry[]>([]),
     [path, setPath] = useState("."),
     [localInput, setLocalInput] = useState(""),
     [remoteInput, setRemoteInput] = useState(".");
+  const [localBack, setLocalBack] = useState<string[]>([]),
+    [localForward, setLocalForward] = useState<string[]>([]),
+    [remoteBack, setRemoteBack] = useState<string[]>([]),
+    [remoteForward, setRemoteForward] = useState<string[]>([]);
   const [localSelected, setLocalSelected] = useState<string[]>([]),
     [remoteSelected, setRemoteSelected] = useState<string[]>([]),
     [localFilter, setLocalFilter] = useState(""),
     [remoteFilter, setRemoteFilter] = useState(""),
-    [hidden, setHidden] = useState(false);
+    [localSort, setLocalSort] = useState<SortState>({ key: "name", asc: true }),
+    [remoteSort, setRemoteSort] = useState<SortState>({
+      key: "name",
+      asc: true,
+    }),
+    [hidden, setHidden] = useState(
+      () => localStorage.getItem("files.hidden") === "true",
+    );
+  const [verifyUploads, setVerifyUploads] = useState(
+    () => localStorage.getItem("files.verifyUploads") !== "false",
+  );
+  const [confirmTransfers, setConfirmTransfers] = useState(
+    () => localStorage.getItem("files.confirmTransfers") !== "false",
+  );
   const [error, setError] = useState(""),
+    [modalError, setModalError] = useState(""),
     [loading, setLoading] = useState(false),
     [pending, setPending] = useState<Pending | null>(null),
     [policy, setPolicy] = useState<"skip" | "replace">("replace"),
     [progress, setProgress] = useState<Progress>(empty),
-    [over, setOver] = useState(false),
-    [transfersVisible, setTransfersVisible] = useState(true);
-  const [operation, setOperation] = useState<{
-      type: "mkdir" | "rename" | "delete";
-      local?: boolean;
-      paths?: string[];
+    [dropZone, setDropZone] = useState<"local" | "remote" | null>(null),
+    [dropFolder, setDropFolder] = useState<{
+      side: "local" | "remote";
       path: string;
-      value: string;
+      name: string;
     } | null>(null),
-    [edit, setEdit] = useState<{ path: string; text: string } | null>(null);
-  const remoteElement = useRef<HTMLDivElement>(null),
+    [transfersVisible, setTransfersVisible] = useState(true),
+    [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
+  const [operation, setOperation] = useState<{
+    type: "mkdir" | "mkfile" | "rename" | "delete" | "chmod";
+    local?: boolean;
+    paths?: string[];
+    path: string;
+    value: string;
+  } | null>(null);
+  const [dragPreview, setDragPreview] = useState<{
+    x: number;
+    y: number;
+    count: number;
+    label: string;
+    direction: "upload" | "download";
+  } | null>(null);
+
+  const localElement = useRef<HTMLDivElement>(null),
+    remoteElement = useRef<HTMLDivElement>(null),
     job = useRef<string | null>(null),
     anchor = useRef<Record<string, string>>({}),
     mounted = useRef(true);
+
   const busy =
     progress.status === "planning" ||
     progress.status === "transferring" ||
     progress.status === "verifying";
-  const snapshot = useRef({ id, active, busy, path, blocked: false });
+
+  const snapshot = useRef({
+    id,
+    active,
+    busy,
+    path,
+    localPath: "",
+    blocked: false,
+  });
   snapshot.current = {
     id,
     active,
     busy,
     path,
-    blocked: !!(pending || operation || edit),
+    localPath: local?.path ?? "",
+    blocked: !!(pending || operation),
   };
+  const dragHandlers = useRef({
+    queueTransfer: (
+      _sources: string[],
+      _upload: boolean,
+      _destination?: string,
+    ) => {},
+    copyExplorerToLocal: (_paths: string[], _targetDir: string) => {},
+  });
+
   const transferCallback = useRef(onTransfer);
   transferCallback.current = onTransfer;
   useEffect(() => {
@@ -158,53 +313,96 @@ export default function FilesPane({
     progress.skippedFiles,
     queuedCount,
   ]);
-  async function loadLocal(next?: string) {
+
+  async function loadLocal(
+    next?: string,
+    historyMode: "push" | "back" | "forward" | "none" = "push",
+  ) {
     const serial = ++localRequest.current;
     try {
+      const prevPath = local?.path;
       const value = await invoke<LocalDirectory>("list_local", {
         path: next ?? null,
       });
       if (!mounted.current || serial !== localRequest.current) return;
+      if (historyMode === "push" && prevPath && prevPath !== value.path) {
+        setLocalBack((prev) => [...prev.slice(-30), prevPath]);
+        setLocalForward([]);
+      }
       setLocal(value);
       setLocalInput(value.path);
       setLocalSelected([]);
       localStorage.setItem("files.localPath", value.path);
     } catch (e) {
-      if (mounted.current && serial === localRequest.current)
+      if (mounted.current && serial === localRequest.current) {
+        setLocalInput(local?.path ?? "");
         setError(errorText(e));
+      }
     }
   }
-  async function loadRemote(next = path) {
+
+  async function loadRemote(
+    next = path,
+    historyMode: "push" | "back" | "forward" | "none" = "push",
+  ) {
     if (!id) return;
     const serial = ++remoteRequest.current;
     setLoading(true);
     try {
-      const entries = await invoke<FileEntry[]>("list_remote", {
-        id,
-        path: next,
-      });
+      const prevPath = path;
+      const result = await invoke<RemoteDirectory | FileEntry[]>(
+        "list_remote",
+        {
+          id,
+          path: next,
+        },
+      );
       if (!mounted.current || serial !== remoteRequest.current) return;
+      const resolvedPath = Array.isArray(result) ? next : result.path;
+      const entries = Array.isArray(result) ? result : result.entries;
+      if (
+        historyMode === "push" &&
+        prevPath &&
+        prevPath !== "." &&
+        prevPath !== resolvedPath
+      ) {
+        setRemoteBack((prev) => [...prev.slice(-30), prevPath]);
+        setRemoteForward([]);
+      }
       setRemote(entries);
-      setPath(next);
-      setRemoteInput(next);
+      setPath(resolvedPath);
+      setRemoteInput(resolvedPath);
       setRemoteSelected([]);
     } catch (e) {
-      if (mounted.current && serial === remoteRequest.current)
+      if (mounted.current && serial === remoteRequest.current) {
+        setRemoteInput(path);
         setError(errorText(e));
+      }
     } finally {
       if (mounted.current && serial === remoteRequest.current)
         setLoading(false);
     }
   }
+
   useEffect(() => {
     mounted.current = true;
-    if (desktop)
-      void loadLocal(localStorage.getItem("files.localPath") || undefined);
+    if (desktop) {
+      void loadLocal(
+        localStorage.getItem("files.localPath") || undefined,
+        "none",
+      );
+      void invoke<LocalPlaces>("list_local_places")
+        .then((p) => {
+          if (mounted.current) setPlaces(p);
+        })
+        .catch(() => {});
+    }
     return () => {
       mounted.current = false;
       if (job.current) void invoke("cancel_transfer", { jobId: job.current });
     };
   }, []);
+
   useEffect(() => {
     let disposed = false;
     remoteRequest.current++;
@@ -214,11 +412,13 @@ export default function FilesPane({
     job.current = null;
     setRemote([]);
     setRemoteSelected([]);
+    setRemoteBack([]);
+    setRemoteForward([]);
     setError("");
     if (id)
       void invoke<string>("remote_home", { id })
         .then((home) => {
-          if (!disposed) void loadRemote(home);
+          if (!disposed) void loadRemote(home, "none");
         })
         .catch((e) => {
           if (!disposed) setError(errorText(e));
@@ -228,10 +428,54 @@ export default function FilesPane({
       if (job.current) void invoke("cancel_transfer", { jobId: job.current });
     };
   }, [id]);
+
+  useEffect(() => {
+    if (id && refreshToken > 0) {
+      void loadRemote(path, "none");
+    }
+  }, [refreshToken]);
+
   useEffect(() => {
     localStorage.setItem("files.mode", mode);
   }, [mode]);
-  // Explorer paths come from Tauri's native events; browser File objects omit them.
+
+  useEffect(() => {
+    localStorage.setItem("files.hidden", String(hidden));
+  }, [hidden]);
+
+  useEffect(() => {
+    localStorage.setItem("files.verifyUploads", String(verifyUploads));
+  }, [verifyUploads]);
+
+  useEffect(() => {
+    localStorage.setItem("files.confirmTransfers", String(confirmTransfers));
+  }, [confirmTransfers]);
+
+  useEffect(() => {
+    if (!contextMenu) return;
+    const dismiss = () => setContextMenu(null);
+    window.addEventListener("pointerdown", dismiss);
+    window.addEventListener("keydown", dismiss);
+    return () => {
+      window.removeEventListener("pointerdown", dismiss);
+      window.removeEventListener("keydown", dismiss);
+    };
+  }, [contextMenu]);
+
+  useEffect(() => {
+    if (!pending && !operation) return;
+    const onKey = (e: globalThis.KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setPending(null);
+        setOperation(null);
+        setModalError("");
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [pending, operation]);
+
+  // Explorer native drops: Remote uploads or Local folder copies.
   useEffect(() => {
     if (!desktop) return;
     let disposed = false;
@@ -239,40 +483,95 @@ export default function FilesPane({
     void getCurrentWebview()
       .onDragDropEvent((event) => {
         const current = snapshot.current;
-        if (
-          !current.active ||
-          !current.id ||
-          current.blocked ||
-          !remoteElement.current
-        ) {
-          setOver(false);
+        if (!current.active || current.blocked) {
+          setDropZone(null);
+          setDropFolder(null);
           return;
         }
         const payload = event.payload;
         if (payload.type === "leave") {
-          setOver(false);
+          setDropZone(null);
+          setDropFolder(null);
           return;
         }
         const x = payload.position.x / window.devicePixelRatio;
         const y = payload.position.y / window.devicePixelRatio;
         const hit = document.elementFromPoint(x, y);
-        const inside =
+        const insideRemote =
+          Boolean(current.id) &&
+          remoteElement.current &&
           hit?.closest(".remote-browser") === remoteElement.current;
-        setOver(inside && payload.type !== "drop");
-        if (payload.type === "drop" && payload.paths.length) {
-          if (!inside) {
-            setError("Drop files inside the Remote file panel to upload them.");
-            return;
+        const insideLocal =
+          Boolean(current.localPath) &&
+          localElement.current &&
+          hit?.closest(".local-browser") === localElement.current;
+
+        const targetZone = insideRemote
+          ? "remote"
+          : insideLocal
+            ? "local"
+            : null;
+        setDropZone(payload.type !== "drop" ? targetZone : null);
+
+        if (payload.type !== "drop") {
+          if (insideRemote) {
+            const folderEl = hit?.closest<HTMLElement>(
+              "[data-remote-directory]",
+            );
+            setDropFolder(
+              folderEl?.dataset.remoteDirectory
+                ? {
+                    side: "remote",
+                    path: folderEl.dataset.remoteDirectory,
+                    name: folderEl.dataset.name || "",
+                  }
+                : null,
+            );
+          } else if (insideLocal) {
+            const folderEl = hit?.closest<HTMLElement>(
+              "[data-local-directory]",
+            );
+            setDropFolder(
+              folderEl?.dataset.localDirectory
+                ? {
+                    side: "local",
+                    path: folderEl.dataset.localDirectory,
+                    name: folderEl.dataset.name || "",
+                  }
+                : null,
+            );
+          } else {
+            setDropFolder(null);
           }
+          return;
+        }
+
+        setDropZone(null);
+        setDropFolder(null);
+        if (!payload.paths.length) return;
+        const uniquePaths = [...new Set(payload.paths)];
+
+        if (insideRemote && current.id) {
           const target = hit?.closest<HTMLElement>("[data-remote-directory]")
             ?.dataset.remoteDirectory;
-          setError("");
-          setPolicy("replace");
-          setPending({
-            sources: [...new Set(payload.paths)],
-            destination: target || current.path,
-            upload: true,
-          });
+          dragHandlers.current.queueTransfer(
+            uniquePaths,
+            true,
+            target || current.path,
+          );
+        } else if (insideLocal && current.localPath) {
+          const target = hit?.closest<HTMLElement>("[data-local-directory]")
+            ?.dataset.localDirectory;
+          dragHandlers.current.copyExplorerToLocal(
+            uniquePaths,
+            target || current.localPath,
+          );
+        } else {
+          setError(
+            current.id
+              ? "Drop files inside the Remote or Local file panel."
+              : "Connect to a server before dropping files into Remote.",
+          );
         }
       })
       .then((fn) => {
@@ -288,6 +587,61 @@ export default function FilesPane({
       unlisten?.();
     };
   }, []);
+
+  async function copyExplorerToLocal(paths: string[], targetDir: string) {
+    try {
+      setError("");
+      await invoke("local_action", {
+        action: "copy",
+        paths,
+        name: targetDir,
+      });
+      await loadLocal(local?.path ?? targetDir, "none");
+    } catch (e) {
+      setError(errorText(e));
+    }
+  }
+  dragHandlers.current = {
+    queueTransfer,
+    copyExplorerToLocal: (paths, targetDir) => {
+      void copyExplorerToLocal(paths, targetDir);
+    },
+  };
+
+  const visibleLocal = useMemo(() => {
+    const filtered = (local?.entries ?? []).filter(
+      (e) =>
+        (hidden || !e.name.startsWith(".")) &&
+        e.name.toLowerCase().includes(localFilter.toLowerCase()),
+    );
+    return sortEntries(filtered, localSort);
+  }, [local, hidden, localFilter, localSort]);
+
+  const visibleRemote = useMemo(() => {
+    const filtered = remote.filter(
+      (e) =>
+        (hidden || !e.name.startsWith(".")) &&
+        e.name.toLowerCase().includes(remoteFilter.toLowerCase()),
+    );
+    return sortEntries(filtered, remoteSort);
+  }, [remote, hidden, remoteFilter, remoteSort]);
+
+  // Prune hidden selections when filter or hidden toggle hides items.
+  useEffect(() => {
+    const allowed = new Set(visibleLocal.map((e) => e.path));
+    setLocalSelected((prev) => {
+      const next = prev.filter((p) => allowed.has(p));
+      return next.length === prev.length ? prev : next;
+    });
+  }, [visibleLocal]);
+
+  useEffect(() => {
+    const allowed = new Set(visibleRemote.map((e) => e.path));
+    setRemoteSelected((prev) => {
+      const next = prev.filter((p) => allowed.has(p));
+      return next.length === prev.length ? prev : next;
+    });
+  }, [visibleRemote]);
 
   function select(
     event: MouseEvent,
@@ -317,27 +671,51 @@ export default function FilesPane({
         : [file],
     );
   }
-  function queue(sources: string[], upload: boolean, destination?: string) {
+
+  function queueTransfer(
+    sources: string[],
+    upload: boolean,
+    destination?: string,
+  ) {
     if (!id || !sources.length) return;
+    const dest = destination ?? (upload ? path : (local?.path ?? ""));
+    if (!dest) return;
     setError("");
+    const batch: Pending = { sources, destination: dest, upload };
+    if (!confirmTransfers) {
+      void enqueueOrRun(batch, policy, verifyUploads);
+      return;
+    }
     setPolicy("replace");
-    setPending({
-      sources,
-      destination: destination ?? (upload ? path : (local?.path ?? "")),
-      upload,
-    });
+    setPending(batch);
   }
+
+  async function enqueueOrRun(
+    batch: Pending,
+    selectedPolicy: "skip" | "replace",
+    verify: boolean,
+  ) {
+    if (job.current) {
+      queued.current.push({ batch, policy: selectedPolicy, verify });
+      setQueuedCount(queued.current.length);
+      return;
+    }
+    await executeBatch(batch, selectedPolicy, verify);
+  }
+
   async function chooseUpload(directory = false) {
     try {
       const chosen = await open({ multiple: true, directory });
-      if (chosen) queue(typeof chosen === "string" ? [chosen] : chosen, true);
+      if (chosen)
+        queueTransfer(typeof chosen === "string" ? [chosen] : chosen, true);
     } catch (e) {
       setError(errorText(e));
     }
   }
-  async function download() {
+
+  async function download(sources = remoteSelected) {
     try {
-      if (!id || !remoteSelected.length) return;
+      if (!id || !sources.length) return;
       let destination = local?.path;
       if (mode !== "both" || !destination) {
         const chosen = await open({
@@ -348,30 +726,30 @@ export default function FilesPane({
         if (typeof chosen !== "string") return;
         destination = chosen;
       }
-      queue(remoteSelected, false, destination);
+      queueTransfer(sources, false, destination);
     } catch (e) {
       setError(errorText(e));
     }
   }
+
   async function startBatch() {
     if (!pending || !id) return;
+    const nextBatch = pending;
     setPending(null);
-    if (job.current) {
-      queued.current.push({ batch: pending, policy });
-      setQueuedCount(queued.current.length);
-      return;
-    }
-    await executeBatch(pending, policy);
+    await enqueueOrRun(nextBatch, policy, verifyUploads);
   }
+
   async function executeBatch(
     batch: Pending,
     selectedPolicy: "skip" | "replace",
+    verify: boolean,
   ) {
     const sessionId = snapshot.current.id;
     if (!sessionId) return;
     const request = {
       ...batch,
       policy: selectedPolicy,
+      verify,
       jobId: crypto.randomUUID(),
     };
     job.current = request.jobId;
@@ -404,15 +782,16 @@ export default function FilesPane({
       if (job.current !== request.jobId) return;
       job.current = null;
       if (mounted.current && snapshot.current.id === sessionId) {
-        void loadRemote();
-        if (local) void loadLocal(local.path);
+        void loadRemote(path, "none");
+        if (local) void loadLocal(local.path, "none");
         if (failed) queued.current = [];
         const next = queued.current.shift();
         setQueuedCount(queued.current.length);
-        if (next) void executeBatch(next.batch, next.policy);
+        if (next) void executeBatch(next.batch, next.policy, next.verify);
       }
     }
   }
+
   async function chooseLocal() {
     try {
       const chosen = await open({
@@ -425,85 +804,176 @@ export default function FilesPane({
       setError(errorText(e));
     }
   }
+
   async function action() {
     if (!operation || (!operation.local && !id)) return;
+    setModalError("");
     try {
       if (operation.local) {
         await invoke("local_action", {
           action: operation.type,
-          paths: operation.paths || [operation.path],
-          name: operation.type === "rename" ? operation.value : null,
+          paths:
+            operation.type === "mkdir"
+              ? [local!.path]
+              : operation.paths || [operation.path],
+          name:
+            operation.type === "rename" || operation.type === "mkdir"
+              ? operation.value.trim()
+              : null,
         });
-      } else
-        for (const item of operation.paths || [operation.path])
+        setOperation(null);
+        await loadLocal(local?.path, "none");
+      } else if (operation.type === "delete") {
+        const targets = operation.paths || [operation.path];
+        if (targets.length > 1) {
+          const result = await invoke<DeleteBatchResult>(
+            "remote_delete_batch",
+            {
+              id,
+              paths: targets,
+            },
+          );
+          if (result.failed.length > 0) {
+            const firstFew = result.failed
+              .slice(0, 3)
+              .map((f) => `${f.path}: ${f.error}`)
+              .join("; ");
+            setModalError(
+              `Deleted ${result.deleted.length}, failed ${result.failed.length}: ${firstFew}`,
+            );
+            await loadRemote(path, "none");
+            return;
+          }
+        } else {
           await invoke("remote_action", {
             id,
-            action: operation.type,
-            path:
-              operation.type === "mkdir" ? join(path, operation.value) : item,
-            destination:
-              operation.type === "rename" ? join(path, operation.value) : null,
+            action: "delete",
+            path: targets[0],
+            destination: null,
+            mode: null,
           });
-      setOperation(null);
-      if (operation.local) void loadLocal(local?.path);
-      else void loadRemote();
+        }
+        setOperation(null);
+        await loadRemote(path, "none");
+      } else {
+        const trimmed = operation.value.trim();
+        await invoke("remote_action", {
+          id,
+          action: operation.type,
+          path:
+            operation.type === "mkdir" || operation.type === "mkfile"
+              ? joinRemote(path, trimmed)
+              : operation.path,
+          destination:
+            operation.type === "rename" ? joinRemote(path, trimmed) : null,
+          mode: operation.type === "chmod" ? Number.parseInt(trimmed, 8) : null,
+        });
+        setOperation(null);
+        await loadRemote(path, "none");
+      }
     } catch (e) {
-      setError(errorText(e));
+      setModalError(errorText(e));
     }
   }
-  async function editFile() {
-    const selected = remote.find((e) => e.path === remoteSelected[0]);
-    if (!selected || selected.directory) return;
+
+  function openRemoteItem(file: FileEntry) {
+    if (file.directory) {
+      void loadRemote(file.path);
+      return;
+    }
+    if (isLikelyBinary(file.name)) {
+      if (
+        confirm(
+          `“${file.name}” looks like a binary file (${bytes(file.size)}). Download it instead of opening in the editor?`,
+        )
+      ) {
+        void download([file.path]);
+        return;
+      }
+    }
+    onOpenEditor?.(file.path);
+  }
+
+  function openLocalItem(file: FileEntry) {
+    if (file.directory) {
+      void loadLocal(file.path);
+      return;
+    }
+    if (desktop) {
+      void invoke("open_local_default", { path: file.path }).catch((e) =>
+        setError(errorText(e)),
+      );
+    }
+  }
+
+  async function duplicateRemote(file: FileEntry) {
+    if (!id || file.directory) return;
+    const dot = file.name.lastIndexOf(".");
+    const copyName =
+      dot > 0
+        ? `${file.name.slice(0, dot)} copy${file.name.slice(dot)}`
+        : `${file.name} copy`;
     try {
-      setEdit({
-        path: selected.path,
-        text: await invoke<string>("read_remote", { id, path: selected.path }),
+      await invoke("remote_action", {
+        id,
+        action: "duplicate",
+        path: file.path,
+        destination: joinRemote(parentRemote(file.path), copyName),
+        mode: null,
       });
+      await loadRemote(path, "none");
     } catch (e) {
       setError(errorText(e));
     }
   }
-  const visibleLocal = (local?.entries ?? []).filter(
-    (e) =>
-      (hidden || !e.name.startsWith(".")) &&
-      e.name.toLowerCase().includes(localFilter.toLowerCase()),
-  );
-  const visibleRemote = remote.filter(
-    (e) =>
-      (hidden || !e.name.startsWith(".")) &&
-      e.name.toLowerCase().includes(remoteFilter.toLowerCase()),
-  );
+
   const selectedRemote = remote.find((e) => e.path === remoteSelected[0]);
   const typeahead = useRef({ side: "", text: "", time: 0 });
   const internalDrag = useRef<null | {
+    source: "local" | "remote";
     x: number;
     y: number;
     paths: string[];
     moved: boolean;
     pointer: number;
     element: HTMLElement;
+    externalStarted?: boolean;
   }>(null);
   const suppressClick = useRef(false);
   const [dragging, setDragging] = useState(false);
-  function requestOperation(type: "rename" | "delete", isLocal: boolean) {
-    const selected = isLocal ? localSelected : remoteSelected;
+
+  function requestOperation(
+    type: "rename" | "delete" | "chmod",
+    isLocal: boolean,
+    explicitPaths?: string[],
+  ) {
+    const selected =
+      explicitPaths ?? (isLocal ? localSelected : remoteSelected);
     const entries = isLocal ? local?.entries || [] : remote;
     if (
       !selected.length ||
       busy ||
-      (type === "rename" && selected.length !== 1)
+      ((type === "rename" || type === "chmod") && selected.length !== 1)
     )
       return;
     const first = entries.find((f) => f.path === selected[0]);
-    if (first)
+    if (first) {
+      setModalError("");
       setOperation({
         type,
         local: isLocal,
         paths: [...selected],
         path: first.path,
-        value: selected.length === 1 ? first.name : `${selected.length} items`,
+        value:
+          type === "chmod"
+            ? formatOctalPermissions(first.permissions).replace("—", "644")
+            : selected.length === 1
+              ? first.name
+              : `${selected.length} items`,
       });
+    }
   }
+
   function browserKey(
     e: KeyboardEvent,
     entries: FileEntry[],
@@ -512,8 +982,7 @@ export default function FilesPane({
     if (
       (e.target as HTMLElement).closest("input, textarea, select, button") ||
       pending ||
-      operation ||
-      edit
+      operation
     )
       return;
     const selected = isLocal ? localSelected : remoteSelected;
@@ -546,10 +1015,16 @@ export default function FilesPane({
       update(entries.map((f) => f.path));
     } else if (e.key === "Enter") {
       const file = entries[index];
-      if (file?.directory) {
+      if (file) {
         e.preventDefault();
-        void (isLocal ? loadLocal(file.path) : loadRemote(file.path));
+        if (isLocal) openLocalItem(file);
+        else openRemoteItem(file);
       }
+    } else if (e.key === "Backspace") {
+      e.preventDefault();
+      if (isLocal && local?.parent) void loadLocal(local.parent);
+      else if (!isLocal && id && path !== "/")
+        void loadRemote(parentRemote(path));
     } else if (["ArrowDown", "ArrowUp", "Home", "End"].includes(e.key)) {
       e.preventDefault();
       focus(
@@ -583,122 +1058,272 @@ export default function FilesPane({
       focus(ordered.find((f) => f.name.toLocaleLowerCase().startsWith(text)));
     }
   }
-  function remoteTarget(x: number, y: number) {
+
+  function resolveDropTarget(
+    x: number,
+    y: number,
+    targetSide: "local" | "remote",
+  ): { dir: string; folderName: string | null } | null {
     const hit = document.elementFromPoint(x, y);
+    if (snapshot.current.blocked || !snapshot.current.id) return null;
+    if (targetSide === "remote") {
+      if (hit?.closest(".remote-browser") !== remoteElement.current)
+        return null;
+      const folderEl = hit?.closest<HTMLElement>("[data-remote-directory]");
+      return {
+        dir: folderEl?.dataset.remoteDirectory || snapshot.current.path,
+        folderName: folderEl?.dataset.name || null,
+      };
+    }
     if (
-      hit?.closest(".remote-browser") !== remoteElement.current ||
-      !snapshot.current.id ||
-      snapshot.current.blocked
+      !snapshot.current.localPath ||
+      hit?.closest(".local-browser") !== localElement.current
     )
       return null;
-    return (
-      hit?.closest<HTMLElement>("[data-remote-directory]")?.dataset
-        .remoteDirectory || snapshot.current.path
-    );
+    const folderEl = hit?.closest<HTMLElement>("[data-local-directory]");
+    return {
+      dir: folderEl?.dataset.localDirectory || snapshot.current.localPath,
+      folderName: folderEl?.dataset.name || null,
+    };
   }
-  function beginLocalDrag(
+
+  function beginDrag(
     e: ReactPointerEvent<HTMLDivElement>,
     file: FileEntry,
+    isLocal: boolean,
   ) {
-    if (e.button !== 0 || !id || file.symlink) return;
+    // Do not initiate drag on right-click, double-click, or disconnected session.
+    if (e.button !== 0 || e.detail >= 2 || !id || file.symlink) return;
+    const selected = isLocal ? localSelected : remoteSelected;
     internalDrag.current = {
+      source: isLocal ? "local" : "remote",
       x: e.clientX,
       y: e.clientY,
-      paths: localSelected.includes(file.path)
-        ? [...localSelected]
-        : [file.path],
+      paths: selected.includes(file.path) ? [...selected] : [file.path],
       moved: false,
       pointer: e.pointerId,
       element: e.currentTarget,
     };
-    // Native WebView2 file-drop interception prevents HTML5 internal drag/drop.
     e.currentTarget.setPointerCapture(e.pointerId);
   }
-  function moveLocalDrag(e: ReactPointerEvent<HTMLDivElement>) {
+
+  function moveDrag(e: ReactPointerEvent<HTMLDivElement>) {
     const d = internalDrag.current;
     if (!d || d.pointer !== e.pointerId) return;
     if (!d.moved && Math.hypot(e.clientX - d.x, e.clientY - d.y) < 6) return;
     e.preventDefault();
     d.moved = true;
     setDragging(true);
-    setOver(remoteTarget(e.clientX, e.clientY) !== null);
+
+    const firstLabel = d.paths[0].split(/[\\/]/).pop() || d.paths[0];
+    setDragPreview({
+      x: e.clientX,
+      y: e.clientY,
+      count: d.paths.length,
+      label: d.paths.length === 1 ? firstLabel : `${d.paths.length} items`,
+      direction: d.source === "local" ? "upload" : "download",
+    });
+
+    // If dragging remote items outside the window on desktop, switch to native Windows OLE drag.
+    if (
+      desktop &&
+      d.source === "remote" &&
+      !d.externalStarted &&
+      (e.clientX <= 1 ||
+        e.clientY <= 1 ||
+        e.clientX >= window.innerWidth - 2 ||
+        e.clientY >= window.innerHeight - 2)
+    ) {
+      d.externalStarted = true;
+      const paths = [...d.paths];
+      internalDrag.current = null;
+      if (d.element.hasPointerCapture(d.pointer))
+        d.element.releasePointerCapture(d.pointer);
+      setDropZone(null);
+      setDropFolder(null);
+      setDragging(false);
+      setDragPreview(null);
+      if (id) {
+        void invoke("start_external_drag", { id, paths }).catch((err) =>
+          setError(errorText(err)),
+        );
+      }
+      return;
+    }
+
+    const targetSide = d.source === "local" ? "remote" : "local";
+    const resolved = resolveDropTarget(e.clientX, e.clientY, targetSide);
+    setDropZone(resolved ? targetSide : null);
+    setDropFolder(
+      resolved?.folderName
+        ? { side: targetSide, path: resolved.dir, name: resolved.folderName }
+        : null,
+    );
   }
-  function endLocalDrag(
-    e: ReactPointerEvent<HTMLDivElement>,
-    cancelled = false,
-  ) {
+
+  function endDrag(e: ReactPointerEvent<HTMLDivElement>, cancelled = false) {
     const d = internalDrag.current;
     if (!d) return;
     internalDrag.current = null;
     if (d.element.hasPointerCapture(d.pointer))
       d.element.releasePointerCapture(d.pointer);
-    setOver(false);
+    setDropZone(null);
+    setDropFolder(null);
     setDragging(false);
+    setDragPreview(null);
     if (d.moved) {
       suppressClick.current = true;
-      const target = !cancelled && remoteTarget(e.clientX, e.clientY);
-      if (target) queue(d.paths, true, target);
+      const targetSide = d.source === "local" ? "remote" : "local";
+      const resolved =
+        !cancelled && resolveDropTarget(e.clientX, e.clientY, targetSide);
+      if (resolved) {
+        queueTransfer(d.paths, d.source === "local", resolved.dir);
+      }
       window.setTimeout(() => {
         suppressClick.current = false;
       }, 0);
     }
   }
+
+  function toggleSort(isLocal: boolean, key: SortKey) {
+    const updater = isLocal ? setLocalSort : setRemoteSort;
+    updater((prev) =>
+      prev.key === key ? { key, asc: !prev.asc } : { key, asc: true },
+    );
+  }
+
   function rows(entries: FileEntry[], isLocal: boolean) {
     const selected = isLocal ? localSelected : remoteSelected;
-    return entries.map((file) => (
-      <div
-        key={file.path}
-        data-path={file.path}
-        role="option"
-        aria-selected={selected.includes(file.path)}
-        tabIndex={0}
-        className={`browser-row ${selected.includes(file.path) ? "selected" : ""}`}
-        data-remote-directory={
-          !isLocal && file.directory ? file.path : undefined
-        }
-        draggable={!desktop && isLocal && !file.symlink}
-        onPointerDown={isLocal ? (e) => beginLocalDrag(e, file) : undefined}
-        onPointerMove={isLocal ? moveLocalDrag : undefined}
-        onPointerUp={isLocal ? (e) => endLocalDrag(e) : undefined}
-        onPointerCancel={isLocal ? (e) => endLocalDrag(e, true) : undefined}
-        onDragStart={(e) => {
-          if (!isLocal) return;
-          e.dataTransfer.setData(
-            dragType,
-            JSON.stringify(
+    return entries.map((file) => {
+      const isDropFolder =
+        dropFolder &&
+        dropFolder.side === (isLocal ? "local" : "remote") &&
+        dropFolder.path === file.path;
+      return (
+        <div
+          key={file.path}
+          data-path={file.path}
+          data-name={file.name}
+          role="option"
+          aria-selected={selected.includes(file.path)}
+          tabIndex={0}
+          className={`browser-row ${selected.includes(file.path) ? "selected" : ""} ${isDropFolder ? "drop-folder-hover" : ""}`}
+          data-remote-directory={
+            !isLocal && file.directory ? file.path : undefined
+          }
+          data-local-directory={
+            isLocal && file.directory ? file.path : undefined
+          }
+          draggable={!desktop && !file.symlink}
+          onPointerDown={(e) => beginDrag(e, file, isLocal)}
+          onPointerMove={moveDrag}
+          onPointerUp={(e) => endDrag(e)}
+          onPointerCancel={(e) => endDrag(e, true)}
+          onDragStart={(e) => {
+            const payload = JSON.stringify(
               selected.includes(file.path) ? selected : [file.path],
-            ),
-          );
-          e.dataTransfer.effectAllowed = "copy";
-        }}
-        onClick={(e) => {
-          if (!suppressClick.current) select(e, file.path, entries, isLocal);
-        }}
-        onDoubleClick={() => {
-          if (file.directory)
-            void (isLocal ? loadLocal(file.path) : loadRemote(file.path));
-        }}
-      >
-        {file.directory ? (
-          <Folder size={15} className="folder-icon" />
-        ) : (
-          <File size={15} />
-        )}
-        <span className="browser-name">
-          {file.name}
-          {file.symlink ? " ↗" : ""}
-        </span>
-        <span className="browser-size">
-          {file.directory ? "—" : bytes(file.size)}
-        </span>
-        <span className="browser-date">
-          {file.modified
-            ? new Date(file.modified * 1000).toLocaleDateString()
-            : ""}
-        </span>
-      </div>
-    ));
+            );
+            e.dataTransfer.setData(
+              isLocal ? dragTypeLocal : dragTypeRemote,
+              payload,
+            );
+            e.dataTransfer.effectAllowed = "copy";
+          }}
+          onClick={(e) => {
+            if (!suppressClick.current) select(e, file.path, entries, isLocal);
+          }}
+          onDoubleClick={() => {
+            if (isLocal) openLocalItem(file);
+            else openRemoteItem(file);
+          }}
+          onContextMenu={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            if (!selected.includes(file.path)) {
+              (isLocal ? setLocalSelected : setRemoteSelected)([file.path]);
+              anchor.current[isLocal ? "local" : "remote"] = file.path;
+            }
+            setContextMenu({
+              x: e.clientX,
+              y: e.clientY,
+              isLocal,
+              file,
+            });
+          }}
+        >
+          {file.directory ? (
+            <Folder size={15} className="folder-icon" />
+          ) : (
+            <File size={15} />
+          )}
+          <span className="browser-name" title={file.name}>
+            {file.name}
+            {file.symlink ? " ↗" : ""}
+          </span>
+          <span className="browser-size">
+            {file.directory ? "—" : bytes(file.size)}
+          </span>
+          <span className="browser-date">
+            {file.modified
+              ? new Date(file.modified * 1000).toLocaleDateString()
+              : ""}
+          </span>
+        </div>
+      );
+    });
   }
+
+  function columnHeaders(isLocal: boolean) {
+    const sort = isLocal ? localSort : remoteSort;
+    const mark = (k: SortKey) =>
+      sort.key === k ? (sort.asc ? " ▲" : " ▼") : "";
+    return (
+      <div className="browser-columns">
+        <button type="button" onClick={() => toggleSort(isLocal, "name")}>
+          Name{mark("name")}
+        </button>
+        <button type="button" onClick={() => toggleSort(isLocal, "size")}>
+          Size{mark("size")}
+        </button>
+        <button type="button" onClick={() => toggleSort(isLocal, "modified")}>
+          Modified{mark("modified")}
+        </button>
+      </div>
+    );
+  }
+
+  function goBack(isLocal: boolean) {
+    if (isLocal) {
+      const target = localBack.at(-1);
+      if (!target || !local) return;
+      setLocalBack((p) => p.slice(0, -1));
+      setLocalForward((p) => [...p, local.path]);
+      void loadLocal(target, "back");
+    } else {
+      const target = remoteBack.at(-1);
+      if (!target) return;
+      setRemoteBack((p) => p.slice(0, -1));
+      setRemoteForward((p) => [...p, path]);
+      void loadRemote(target, "back");
+    }
+  }
+
+  function goForward(isLocal: boolean) {
+    if (isLocal) {
+      const target = localForward.at(-1);
+      if (!target || !local) return;
+      setLocalForward((p) => p.slice(0, -1));
+      setLocalBack((p) => [...p, local.path]);
+      void loadLocal(target, "forward");
+    } else {
+      const target = remoteForward.at(-1);
+      if (!target) return;
+      setRemoteForward((p) => p.slice(0, -1));
+      setRemoteBack((p) => [...p, path]);
+      void loadRemote(target, "forward");
+    }
+  }
+
   function pathBar(isLocal: boolean) {
     return (
       <form
@@ -710,17 +1335,39 @@ export default function FilesPane({
       >
         <button
           type="button"
+          title="Back"
+          disabled={
+            isLocal ? localBack.length === 0 : !id || remoteBack.length === 0
+          }
+          onClick={() => goBack(isLocal)}
+        >
+          <ArrowLeft size={13} />
+        </button>
+        <button
+          type="button"
+          title="Forward"
+          disabled={
+            isLocal
+              ? localForward.length === 0
+              : !id || remoteForward.length === 0
+          }
+          onClick={() => goForward(isLocal)}
+        >
+          <ArrowRight size={13} />
+        </button>
+        <button
+          type="button"
           title={isLocal ? "Local home" : "Remote home"}
           disabled={!isLocal && !id}
           onClick={() => {
-            if (isLocal) void loadLocal();
+            if (isLocal) void loadLocal(places?.home);
             else
               void invoke<string>("remote_home", { id })
                 .then((p) => loadRemote(p))
                 .catch((e) => setError(errorText(e)));
           }}
         >
-          <Home size={14} />
+          <Home size={13} />
         </button>
         <button
           type="button"
@@ -729,10 +1376,10 @@ export default function FilesPane({
           onClick={() =>
             void (isLocal
               ? loadLocal(local!.parent!)
-              : loadRemote(path.replace(/\/[^/]+\/?$/, "") || "/"))
+              : loadRemote(parentRemote(path)))
           }
         >
-          <ArrowUp size={14} />
+          <ArrowUp size={13} />
         </button>
         <input
           aria-label={isLocal ? "Local path" : "Remote path"}
@@ -745,6 +1392,15 @@ export default function FilesPane({
       </form>
     );
   }
+
+  const transferRatio =
+    progress.totalBytes > 0
+      ? progress.completedBytes / progress.totalBytes
+      : progress.totalFiles > 0
+        ? (progress.completedFiles + progress.skippedFiles) /
+          progress.totalFiles
+        : 0;
+
   return (
     <aside
       className={`file-manager mode-${mode} ${dragging ? "internal-dragging" : ""}`}
@@ -762,10 +1418,14 @@ export default function FilesPane({
         tabIndex={0}
         onKeyDown={(e) => {
           if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+            const maxW = Math.max(
+              mode === "both" ? 420 : 280,
+              window.innerWidth - 520,
+            );
             const next = Math.max(
-              mode === "both" ? 480 : 280,
+              mode === "both" ? 420 : 280,
               Math.min(
-                mode === "both" ? window.innerWidth - 660 : 560,
+                maxW,
                 (mode === "both" ? width : singleWidth) +
                   (e.key === "ArrowLeft" ? 20 : -20),
               ),
@@ -784,12 +1444,13 @@ export default function FilesPane({
             initial =
               e.currentTarget.parentElement!.getBoundingClientRect().width;
           const move = (event: PointerEvent) => {
+            const maxW = Math.max(
+              mode === "both" ? 420 : 280,
+              window.innerWidth - 520,
+            );
             const next = Math.max(
-              mode === "both" ? 480 : 280,
-              Math.min(
-                mode === "both" ? window.innerWidth - 660 : 560,
-                initial + start - event.clientX,
-              ),
+              mode === "both" ? 420 : 280,
+              Math.min(maxW, initial + start - event.clientX),
             );
             (mode === "both" ? setWidth : setSingleWidth)(next);
             localStorage.setItem(
@@ -838,11 +1499,82 @@ export default function FilesPane({
       )}
       <div className="file-browsers">
         {mode !== "remote" && (
-          <section className="browser local-browser" aria-label="Local files">
+          <section
+            ref={localElement}
+            className={`browser local-browser ${dropZone === "local" ? "drop-target" : ""}`}
+            aria-label="Local files"
+            onDragOver={(e) => {
+              if (e.dataTransfer.types.includes(dragTypeRemote) && id) {
+                e.preventDefault();
+                e.dataTransfer.dropEffect = "copy";
+                setDropZone("local");
+              }
+            }}
+            onDragLeave={(e) => {
+              if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+                setDropZone(null);
+                setDropFolder(null);
+              }
+            }}
+            onDrop={(e) => {
+              e.preventDefault();
+              setDropZone(null);
+              setDropFolder(null);
+              const value = e.dataTransfer.getData(dragTypeRemote);
+              if (value && local) {
+                const target = (e.target as HTMLElement).closest<HTMLElement>(
+                  "[data-local-directory]",
+                )?.dataset.localDirectory;
+                queueTransfer(JSON.parse(value), false, target || local.path);
+              }
+            }}
+          >
             <div className="browser-toolbar">
               <Laptop size={14} />
               <strong>Local</strong>
+              {places && (
+                <select
+                  aria-label="Quick local places"
+                  className="drive-select"
+                  value=""
+                  onChange={(e) => {
+                    if (e.target.value) void loadLocal(e.target.value);
+                  }}
+                >
+                  <option value="">Places…</option>
+                  {places.desktop && (
+                    <option value={places.desktop}>Desktop</option>
+                  )}
+                  {places.downloads && (
+                    <option value={places.downloads}>Downloads</option>
+                  )}
+                  {places.documents && (
+                    <option value={places.documents}>Documents</option>
+                  )}
+                  <option value={places.home}>Home</option>
+                  {places.drives.map((d) => (
+                    <option key={d.path} value={d.path}>
+                      {d.label} ({d.path})
+                    </option>
+                  ))}
+                </select>
+              )}
               <span className="spacer" />
+              <button
+                title="New local folder"
+                disabled={!local || busy}
+                onClick={() => {
+                  setModalError("");
+                  setOperation({
+                    type: "mkdir",
+                    local: true,
+                    path: local?.path ?? "",
+                    value: "New folder",
+                  });
+                }}
+              >
+                <FolderPlus size={15} />
+              </button>
               <button
                 title="Choose local folder"
                 onClick={() => void chooseLocal()}
@@ -852,13 +1584,13 @@ export default function FilesPane({
               <button
                 title="Upload selection"
                 disabled={!id || !localSelected.length}
-                onClick={() => queue(localSelected, true)}
+                onClick={() => queueTransfer(localSelected, true)}
               >
                 <Upload size={15} />
               </button>
               <button
                 title="Refresh local files"
-                onClick={() => void loadLocal(local?.path)}
+                onClick={() => void loadLocal(local?.path, "none")}
               >
                 <RefreshCw size={14} />
               </button>
@@ -872,18 +1604,32 @@ export default function FilesPane({
                 value={localFilter}
                 onChange={(e) => setLocalFilter(e.target.value)}
               />
+              {localFilter && (
+                <button
+                  type="button"
+                  title="Clear filter"
+                  onClick={() => setLocalFilter("")}
+                >
+                  <X size={12} />
+                </button>
+              )}
             </div>
-            <div className="browser-columns">
-              <span>Name</span>
-              <span>Size</span>
-              <span>Modified</span>
-            </div>
+            {columnHeaders(true)}
             <div
               className="browser-list"
               role="listbox"
               aria-label="Local directory"
               tabIndex={0}
               onKeyDown={(e) => browserKey(e, visibleLocal, true)}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                setContextMenu({
+                  x: e.clientX,
+                  y: e.clientY,
+                  isLocal: true,
+                  file: null,
+                });
+              }}
               aria-multiselectable="true"
             >
               {rows(visibleLocal, true)}
@@ -900,11 +1646,36 @@ export default function FilesPane({
                 <p className="browser-empty">No matching items</p>
               )}
             </div>
+            {dropZone === "local" && (
+              <div className="drop-pill">
+                <Download size={13} />
+                <span>
+                  {dropFolder?.side === "local"
+                    ? `Drop into ${dropFolder.name}`
+                    : "Drop to download / copy here"}
+                </span>
+              </div>
+            )}
             <div className="browser-footer">
-              {localSelected.length
-                ? `${localSelected.length} selected`
-                : `${visibleLocal.length} items`}
+              <span>
+                {localSelected.length
+                  ? `${localSelected.length} selected`
+                  : `${visibleLocal.length} items`}
+              </span>
               <span className="spacer" />
+              <button
+                title="Select all local items"
+                disabled={!visibleLocal.length}
+                onClick={() =>
+                  setLocalSelected(
+                    localSelected.length === visibleLocal.length
+                      ? []
+                      : visibleLocal.map((f) => f.path),
+                  )
+                }
+              >
+                <CheckSquare size={12} />
+              </button>
               <button
                 title="Rename local item"
                 disabled={localSelected.length !== 1 || busy}
@@ -924,29 +1695,32 @@ export default function FilesPane({
         )}
         {mode !== "local" && (
           <section
-            className={`browser remote-browser ${over ? "drop-target" : ""}`}
+            className={`browser remote-browser ${dropZone === "remote" ? "drop-target" : ""}`}
             ref={remoteElement}
             aria-label="Remote files"
             onDragOver={(e) => {
-              if (e.dataTransfer.types.includes(dragType) && id) {
+              if (e.dataTransfer.types.includes(dragTypeLocal) && id) {
                 e.preventDefault();
                 e.dataTransfer.dropEffect = "copy";
-                setOver(true);
+                setDropZone("remote");
               }
             }}
             onDragLeave={(e) => {
-              if (!e.currentTarget.contains(e.relatedTarget as Node))
-                setOver(false);
+              if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+                setDropZone(null);
+                setDropFolder(null);
+              }
             }}
             onDrop={(e) => {
               e.preventDefault();
-              setOver(false);
-              const value = e.dataTransfer.getData(dragType);
+              setDropZone(null);
+              setDropFolder(null);
+              const value = e.dataTransfer.getData(dragTypeLocal);
               if (value) {
                 const target = (e.target as HTMLElement).closest<HTMLElement>(
                   "[data-remote-directory]",
                 )?.dataset.remoteDirectory;
-                queue(JSON.parse(value), true, target || path);
+                queueTransfer(JSON.parse(value), true, target || path);
               }
             }}
           >
@@ -955,11 +1729,30 @@ export default function FilesPane({
               <strong>{mode === "both" ? "Remote" : "SFTP"}</strong>
               <span className="spacer" />
               <button
+                title="New remote file"
+                disabled={!id || busy}
+                onClick={() => {
+                  setModalError("");
+                  setOperation({
+                    type: "mkfile",
+                    path: "",
+                    value: "new-file.yml",
+                  });
+                }}
+              >
+                <FilePlus size={15} />
+              </button>
+              <button
                 title="New remote folder"
                 disabled={!id || busy}
-                onClick={() =>
-                  setOperation({ type: "mkdir", path: "", value: "New folder" })
-                }
+                onClick={() => {
+                  setModalError("");
+                  setOperation({
+                    type: "mkdir",
+                    path: "",
+                    value: "New folder",
+                  });
+                }}
               >
                 <FolderPlus size={15} />
               </button>
@@ -987,7 +1780,7 @@ export default function FilesPane({
               <button
                 title="Refresh files"
                 disabled={!id || loading}
-                onClick={() => void loadRemote()}
+                onClick={() => void loadRemote(path, "none")}
               >
                 <RefreshCw size={14} className={loading ? "spin" : ""} />
               </button>
@@ -1001,18 +1794,33 @@ export default function FilesPane({
                 value={remoteFilter}
                 onChange={(e) => setRemoteFilter(e.target.value)}
               />
+              {remoteFilter && (
+                <button
+                  type="button"
+                  title="Clear filter"
+                  onClick={() => setRemoteFilter("")}
+                >
+                  <X size={12} />
+                </button>
+              )}
             </div>
-            <div className="browser-columns">
-              <span>Name</span>
-              <span>Size</span>
-              <span>Modified</span>
-            </div>
+            {columnHeaders(false)}
             <div
               className="browser-list"
               role="listbox"
               aria-label="Remote directory"
               tabIndex={0}
               onKeyDown={(e) => browserKey(e, visibleRemote, false)}
+              onContextMenu={(e) => {
+                if (!id) return;
+                e.preventDefault();
+                setContextMenu({
+                  x: e.clientX,
+                  y: e.clientY,
+                  isLocal: false,
+                  file: null,
+                });
+              }}
               aria-multiselectable="true"
             >
               {id ? (
@@ -1028,11 +1836,14 @@ export default function FilesPane({
                 <p className="browser-empty">This folder is empty</p>
               )}
             </div>
-            {over && (
-              <div className="drop-hint">
-                <Upload size={24} />
-                <strong>Upload to this folder</strong>
-                <span>Drop files or folders from Explorer</span>
+            {dropZone === "remote" && (
+              <div className="drop-pill">
+                <Upload size={13} />
+                <span>
+                  {dropFolder?.side === "remote"
+                    ? `Drop to upload into ${dropFolder.name}`
+                    : `Drop to upload into ${path}`}
+                </span>
               </div>
             )}
             <div className="browser-footer">
@@ -1043,14 +1854,27 @@ export default function FilesPane({
               </span>
               <span className="spacer" />
               <button
-                title="Edit text file"
+                title="Select all remote items"
+                disabled={!id || !visibleRemote.length}
+                onClick={() =>
+                  setRemoteSelected(
+                    remoteSelected.length === visibleRemote.length
+                      ? []
+                      : visibleRemote.map((f) => f.path),
+                  )
+                }
+              >
+                <CheckSquare size={12} />
+              </button>
+              <button
+                title="View / Edit remote file"
                 disabled={
                   !selectedRemote ||
                   selectedRemote.directory ||
                   remoteSelected.length !== 1 ||
                   busy
                 }
-                onClick={() => void editFile()}
+                onClick={() => selectedRemote && openRemoteItem(selectedRemote)}
               >
                 <Pencil size={13} />
               </button>
@@ -1078,7 +1902,18 @@ export default function FilesPane({
           title="Show hidden files"
           onClick={() => setHidden(!hidden)}
         >
-          <Eye size={13} /> Hidden files
+          <Eye size={13} /> Hidden
+        </button>
+        <button
+          aria-pressed={!confirmTransfers}
+          title={
+            confirmTransfers
+              ? "Confirm before transferring (click for instant mode)"
+              : "Instant transfer active (click to confirm first)"
+          }
+          onClick={() => setConfirmTransfers(!confirmTransfers)}
+        >
+          {confirmTransfers ? "Ask" : "Instant"}
         </button>
         <span className="spacer" />
         <button onClick={() => setTransfersVisible(!transfersVisible)}>
@@ -1106,7 +1941,9 @@ export default function FilesPane({
                   ? "No files transferred — all items skipped"
                   : progress.skippedFiles > 0
                     ? "Transfer finished with skipped files"
-                    : "Transfer complete — verified"
+                    : verifyUploads
+                      ? "Transfer complete — verified"
+                      : "Transfer complete"
                 : progress.status === "cancelled"
                   ? "Transfer cancelled"
                   : progress.status === "failed"
@@ -1118,7 +1955,7 @@ export default function FilesPane({
                         : "Transferring…"}
             </strong>
             <span className="spacer" />
-            {busy && (
+            {busy ? (
               <button
                 title="Cancel transfer"
                 onClick={() => {
@@ -1130,16 +1967,16 @@ export default function FilesPane({
               >
                 <X size={14} />
               </button>
+            ) : (
+              <button
+                title="Dismiss transfer status"
+                onClick={() => setProgress(empty)}
+              >
+                <X size={14} />
+              </button>
             )}
           </div>
-          <progress
-            max={Math.max(1, progress.totalFiles)}
-            value={
-              progress.status === "completed"
-                ? Math.max(1, progress.totalFiles)
-                : progress.completedFiles + progress.skippedFiles
-            }
-          />
+          <progress max={1000} value={Math.round(transferRatio * 1000)} />
           <div>
             <span>
               {progress.completedFiles} / {progress.totalFiles} files ·{" "}
@@ -1147,8 +1984,325 @@ export default function FilesPane({
             </span>
             <span className="spacer" />
             {bytes(progress.completedBytes)} / {bytes(progress.totalBytes)}
+            {busy && progress.bytesPerSec
+              ? ` · ${bytes(progress.bytesPerSec)}/s`
+              : ""}
           </div>
           <p title={progress.current}>{progress.current}</p>
+        </div>
+      )}
+      {dragPreview && (
+        <div
+          className="drag-ghost"
+          style={{ left: dragPreview.x + 14, top: dragPreview.y + 14 }}
+        >
+          {dragPreview.direction === "upload" ? (
+            <Upload size={13} />
+          ) : (
+            <Download size={13} />
+          )}
+          <span>{dragPreview.label}</span>
+        </div>
+      )}
+      {contextMenu && (
+        <div
+          className="context-menu"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+          role="menu"
+          onPointerDown={(e) => e.stopPropagation()}
+        >
+          {contextMenu.isLocal ? (
+            <>
+              {contextMenu.file && (
+                <>
+                  <button
+                    role="menuitem"
+                    onClick={() => {
+                      openLocalItem(contextMenu.file!);
+                      setContextMenu(null);
+                    }}
+                  >
+                    {contextMenu.file.directory
+                      ? "Open Folder"
+                      : "Open in Default App"}
+                  </button>
+                  <button
+                    role="menuitem"
+                    disabled={!id}
+                    onClick={() => {
+                      queueTransfer(
+                        localSelected.length
+                          ? localSelected
+                          : [contextMenu.file!.path],
+                        true,
+                      );
+                      setContextMenu(null);
+                    }}
+                  >
+                    <Upload size={13} /> Upload to Server
+                  </button>
+                  <button
+                    role="menuitem"
+                    onClick={() => {
+                      void invoke("reveal_local", {
+                        path: contextMenu.file!.path,
+                      }).catch((e) => setError(errorText(e)));
+                      setContextMenu(null);
+                    }}
+                  >
+                    Reveal in Explorer
+                  </button>
+                  <button
+                    role="menuitem"
+                    onClick={() => {
+                      void navigator.clipboard?.writeText(
+                        contextMenu.file!.path,
+                      );
+                      setContextMenu(null);
+                    }}
+                  >
+                    <Copy size={13} /> Copy Path
+                  </button>
+                  <hr />
+                  <button
+                    role="menuitem"
+                    disabled={localSelected.length !== 1 || busy}
+                    onClick={() => {
+                      requestOperation("rename", true, [
+                        contextMenu.file!.path,
+                      ]);
+                      setContextMenu(null);
+                    }}
+                  >
+                    Rename…
+                  </button>
+                  <button
+                    role="menuitem"
+                    className="danger-item"
+                    disabled={busy}
+                    onClick={() => {
+                      requestOperation(
+                        "delete",
+                        true,
+                        localSelected.length
+                          ? localSelected
+                          : [contextMenu.file!.path],
+                      );
+                      setContextMenu(null);
+                    }}
+                  >
+                    <Trash2 size={13} /> Delete…
+                  </button>
+                </>
+              )}
+              {!contextMenu.file && (
+                <>
+                  <button
+                    role="menuitem"
+                    disabled={!local || busy}
+                    onClick={() => {
+                      setModalError("");
+                      setOperation({
+                        type: "mkdir",
+                        local: true,
+                        path: local?.path ?? "",
+                        value: "New folder",
+                      });
+                      setContextMenu(null);
+                    }}
+                  >
+                    <FolderPlus size={13} /> New Folder…
+                  </button>
+                  <button
+                    role="menuitem"
+                    onClick={() => {
+                      setLocalSelected(visibleLocal.map((f) => f.path));
+                      setContextMenu(null);
+                    }}
+                  >
+                    Select All
+                  </button>
+                  <button
+                    role="menuitem"
+                    onClick={() => {
+                      void loadLocal(local?.path, "none");
+                      setContextMenu(null);
+                    }}
+                  >
+                    Refresh
+                  </button>
+                </>
+              )}
+            </>
+          ) : (
+            <>
+              {contextMenu.file && (
+                <>
+                  {contextMenu.file.directory ? (
+                    <button
+                      role="menuitem"
+                      onClick={() => {
+                        void loadRemote(contextMenu.file!.path);
+                        setContextMenu(null);
+                      }}
+                    >
+                      Open Folder
+                    </button>
+                  ) : (
+                    <>
+                      <button
+                        role="menuitem"
+                        onClick={() => {
+                          onOpenEditor?.(contextMenu.file!.path);
+                          setContextMenu(null);
+                        }}
+                      >
+                        <Pencil size={13} /> View / Edit in ShellDock
+                      </button>
+                      <button
+                        role="menuitem"
+                        onClick={() => {
+                          onOpenExternal?.(contextMenu.file!.path);
+                          setContextMenu(null);
+                        }}
+                      >
+                        <ExternalLink size={13} /> Open in Default App
+                        (Auto-Sync)
+                      </button>
+                    </>
+                  )}
+                  <button
+                    role="menuitem"
+                    onClick={() => {
+                      const targets = remoteSelected.length
+                        ? remoteSelected
+                        : [contextMenu.file!.path];
+                      void download(targets);
+                      setContextMenu(null);
+                    }}
+                  >
+                    <Download size={13} /> Download
+                  </button>
+                  {!contextMenu.file.directory && (
+                    <button
+                      role="menuitem"
+                      onClick={() => {
+                        void duplicateRemote(contextMenu.file!);
+                        setContextMenu(null);
+                      }}
+                    >
+                      Duplicate
+                    </button>
+                  )}
+                  <button
+                    role="menuitem"
+                    onClick={() => {
+                      void navigator.clipboard?.writeText(
+                        contextMenu.file!.path,
+                      );
+                      setContextMenu(null);
+                    }}
+                  >
+                    <Copy size={13} /> Copy Path
+                  </button>
+                  <button
+                    role="menuitem"
+                    disabled={remoteSelected.length !== 1 || busy}
+                    onClick={() => {
+                      requestOperation("chmod", false, [
+                        contextMenu.file!.path,
+                      ]);
+                      setContextMenu(null);
+                    }}
+                  >
+                    <Shield size={13} /> Permissions…
+                  </button>
+                  <hr />
+                  <button
+                    role="menuitem"
+                    disabled={remoteSelected.length !== 1 || busy}
+                    onClick={() => {
+                      requestOperation("rename", false, [
+                        contextMenu.file!.path,
+                      ]);
+                      setContextMenu(null);
+                    }}
+                  >
+                    Rename…
+                  </button>
+                  <button
+                    role="menuitem"
+                    className="danger-item"
+                    disabled={busy}
+                    onClick={() => {
+                      requestOperation(
+                        "delete",
+                        false,
+                        remoteSelected.length
+                          ? remoteSelected
+                          : [contextMenu.file!.path],
+                      );
+                      setContextMenu(null);
+                    }}
+                  >
+                    <Trash2 size={13} /> Delete…
+                  </button>
+                </>
+              )}
+              {!contextMenu.file && (
+                <>
+                  <button
+                    role="menuitem"
+                    disabled={!id || busy}
+                    onClick={() => {
+                      setModalError("");
+                      setOperation({
+                        type: "mkfile",
+                        path: "",
+                        value: "new-file.yml",
+                      });
+                      setContextMenu(null);
+                    }}
+                  >
+                    <FilePlus size={13} /> New File…
+                  </button>
+                  <button
+                    role="menuitem"
+                    disabled={!id || busy}
+                    onClick={() => {
+                      setModalError("");
+                      setOperation({
+                        type: "mkdir",
+                        path: "",
+                        value: "New folder",
+                      });
+                      setContextMenu(null);
+                    }}
+                  >
+                    <FolderPlus size={13} /> New Folder…
+                  </button>
+                  <button
+                    role="menuitem"
+                    onClick={() => {
+                      setRemoteSelected(visibleRemote.map((f) => f.path));
+                      setContextMenu(null);
+                    }}
+                  >
+                    Select All
+                  </button>
+                  <button
+                    role="menuitem"
+                    onClick={() => {
+                      void loadRemote(path, "none");
+                      setContextMenu(null);
+                    }}
+                  >
+                    Refresh
+                  </button>
+                </>
+              )}
+            </>
+          )}
         </div>
       )}
       {pending && (
@@ -1175,7 +2329,12 @@ export default function FilesPane({
             </p>
             <label>
               Destination
-              <input readOnly value={pending.destination} />
+              <input
+                value={pending.destination}
+                onChange={(e) =>
+                  setPending({ ...pending, destination: e.target.value })
+                }
+              />
             </label>
             <label>
               When a file already exists
@@ -1188,6 +2347,16 @@ export default function FilesPane({
                 <option value="replace">Replace existing files</option>
               </select>
             </label>
+            {pending.upload && (
+              <label className="check">
+                <input
+                  type="checkbox"
+                  checked={verifyUploads}
+                  onChange={(e) => setVerifyUploads(e.target.checked)}
+                />{" "}
+                Verify uploaded bytes after transfer (slower)
+              </label>
+            )}
             <ul className="transfer-sources">
               {pending.sources.map((source) => (
                 <li key={source}>{source}</li>
@@ -1221,18 +2390,22 @@ export default function FilesPane({
                 ? `Delete ${operation.local ? "local" : "remote"} ${operation.paths && operation.paths.length > 1 ? "items" : "item"}?`
                 : operation.type === "mkdir"
                   ? "New folder"
-                  : "Rename item"}
+                  : operation.type === "mkfile"
+                    ? "New file"
+                    : operation.type === "chmod"
+                      ? "Permissions (chmod)"
+                      : "Rename item"}
             </h2>
             {operation.type === "delete" ? (
               <p>
-                Permanently delete “{operation.value}”?{" "}
-                {operation.local
-                  ? "Folders and their contents will be deleted."
-                  : "Remote folders must be empty."}
+                Permanently delete “{operation.value}”? Folders and all nested
+                contents will be removed.
               </p>
             ) : (
               <label>
-                Name
+                {operation.type === "chmod"
+                  ? "Octal mode (e.g. 644, 755)"
+                  : "Name"}
                 <input
                   required
                   autoFocus
@@ -1243,71 +2416,37 @@ export default function FilesPane({
                 />
               </label>
             )}
+            {modalError && (
+              <p className="error" role="alert">
+                {modalError}
+              </p>
+            )}
             <div className="actions">
-              <button type="button" onClick={() => setOperation(null)}>
+              <button
+                type="button"
+                onClick={() => {
+                  setOperation(null);
+                  setModalError("");
+                }}
+              >
                 Cancel
               </button>
               <button
                 className={operation.type === "delete" ? "danger" : "primary"}
                 disabled={
                   operation.type !== "delete" &&
-                  (!operation.value.trim() ||
-                    operation.value === "." ||
-                    operation.value === ".." ||
-                    /[\\/]/.test(operation.value))
+                  (operation.type === "chmod"
+                    ? !/^[0-7]{3,4}$/.test(operation.value.trim())
+                    : !operation.value.trim() ||
+                      operation.value === "." ||
+                      operation.value === ".." ||
+                      /[\\/]/.test(operation.value))
                 }
               >
                 Confirm
               </button>
             </div>
           </form>
-        </div>
-      )}
-      {edit && (
-        <div className="modal-backdrop">
-          <div
-            className="modal editor"
-            role="dialog"
-            aria-modal="true"
-            aria-label="Remote text editor"
-          >
-            <div className="pane-toolbar">
-              <strong>{edit.path}</strong>
-              <span className="spacer" />
-              <button
-                title="Close editor"
-                onClick={() => {
-                  if (confirm("Discard unsaved changes?")) setEdit(null);
-                }}
-              >
-                <X size={16} />
-              </button>
-            </div>
-            <p className="muted small">
-              Saving replaces the remote file. Concurrent remote changes are not
-              detected.
-            </p>
-            <textarea
-              aria-label="File contents"
-              spellCheck={false}
-              value={edit.text}
-              onChange={(e) => setEdit({ ...edit, text: e.target.value })}
-            />
-            <div className="actions">
-              <button
-                className="primary"
-                onClick={() => {
-                  if (confirm("Replace the remote file with this text?"))
-                    void invoke("write_remote", { id, ...edit })
-                      .then(() => setEdit(null))
-                      .catch((e) => setError(errorText(e)));
-                }}
-              >
-                Save to server
-              </button>
-            </div>
-            {error && <p className="error">{error}</p>}
-          </div>
         </div>
       )}
     </aside>

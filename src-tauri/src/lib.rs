@@ -1,7 +1,7 @@
 use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use ssh2::{FileStat, Session};
+use ssh2::Session;
 use std::{
     collections::HashMap,
     fs,
@@ -10,14 +10,16 @@ use std::{
     path::{Path, PathBuf},
     sync::{mpsc, Arc, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tauri::{ipc::Channel, Manager, State};
 use zeroize::Zeroizing;
+mod drag_out;
 mod files;
+mod sftp;
 
 type Result<T> = std::result::Result<T, String>;
-fn err(e: impl std::fmt::Display) -> String {
+pub(crate) fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 
@@ -61,26 +63,34 @@ struct Store {
     connections: Vec<Connection>,
     hosts: HashMap<String, String>,
 }
-struct Context {
+pub struct Context {
     connection: Connection,
     secret: Zeroizing<String>,
     fingerprint: String,
 }
-enum Input {
+pub enum Input {
     Data(Vec<u8>),
     Resize(u32, u32),
     Close,
 }
-struct Live {
+pub struct Live {
     input: mpsc::Sender<Input>,
     context: Arc<Context>,
+    sftp: Arc<Mutex<Option<sftp::PooledSftp>>>,
+}
+struct PendingHandshake {
+    session: Session,
+    fingerprint: String,
+    created: Instant,
 }
 #[derive(Default)]
-struct Backend {
+pub struct Backend {
     store: Mutex<Store>,
     sessions: Arc<Mutex<HashMap<String, Live>>>,
     path: Mutex<PathBuf>,
     transfers: Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+    handshakes: Mutex<HashMap<String, PendingHandshake>>,
+    external_edits: Arc<Mutex<HashMap<String, sftp::ExternalEditHandle>>>,
 }
 fn persist(state: &Backend, store: &Store) -> Result<()> {
     let path = state.path.lock().map_err(err)?;
@@ -113,8 +123,7 @@ fn handshake(c: &Connection) -> Result<(Session, String)> {
     let fingerprint = format!("SHA256:{}", STANDARD_NO_PAD.encode(Sha256::digest(key)));
     Ok((session, fingerprint))
 }
-fn authenticate(context: &Context) -> Result<Session> {
-    let (session, fingerprint) = handshake(&context.connection)?;
+fn authenticate_session(session: Session, fingerprint: &str, context: &Context) -> Result<Session> {
     if fingerprint != context.fingerprint {
         return Err("Host key changed. Disconnect and review the server fingerprint.".into());
     }
@@ -144,10 +153,16 @@ fn authenticate(context: &Context) -> Result<Session> {
     session.set_keepalive(true, 20);
     Ok(session)
 }
-async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
+pub(crate) fn authenticate(context: &Context) -> Result<Session> {
+    let (session, fingerprint) = handshake(&context.connection)?;
+    authenticate_session(session, &fingerprint, context)
+}
+pub(crate) async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
     tauri::async_runtime::spawn_blocking(f).await.map_err(err)?
 }
-fn context(state: &Backend, id: &str) -> Result<Arc<Context>> {
+pub(crate) fn context(state: &Backend, id: &str) -> Result<Arc<Context>> {
     state
         .sessions
         .lock()
@@ -193,6 +208,18 @@ struct HostProbe {
     fingerprint: String,
     previous: Option<String>,
 }
+fn handshake_key(c: &Connection) -> String {
+    format!("{}|{}", c.id, c.endpoint())
+}
+
+fn take_pending_handshake(state: &Backend, c: &Connection) -> Option<(Session, String)> {
+    let key = handshake_key(c);
+    let mut map = state.handshakes.lock().ok()?;
+    map.retain(|_, item| item.created.elapsed() < Duration::from_secs(60));
+    map.remove(&key)
+        .map(|item| (item.session, item.fingerprint))
+}
+
 #[tauri::command]
 async fn probe_host(state: State<'_, Backend>, connection: Connection) -> Result<HostProbe> {
     let previous = state
@@ -202,11 +229,135 @@ async fn probe_host(state: State<'_, Backend>, connection: Connection) -> Result
         .hosts
         .get(&connection.endpoint())
         .cloned();
+    let key = handshake_key(&connection);
+    let conn = connection.clone();
+    let (session, fingerprint) = blocking(move || handshake(&conn)).await?;
+    if let Ok(mut map) = state.handshakes.lock() {
+        map.retain(|_, item| item.created.elapsed() < Duration::from_secs(60));
+        map.insert(
+            key,
+            PendingHandshake {
+                session,
+                fingerprint: fingerprint.clone(),
+                created: Instant::now(),
+            },
+        );
+    }
+    Ok(HostProbe {
+        fingerprint,
+        previous,
+    })
+}
+
+#[tauri::command]
+async fn list_saved_credentials(state: State<'_, Backend>) -> Result<Vec<String>> {
+    let ids: Vec<String> = state
+        .store
+        .lock()
+        .map_err(err)?
+        .connections
+        .iter()
+        .map(|c| c.id.clone())
+        .collect();
     blocking(move || {
-        let (_, fingerprint) = handshake(&connection)?;
-        Ok(HostProbe {
+        Ok(ids
+            .into_iter()
+            .filter(|id| {
+                keyring::Entry::new("ShellDock", id)
+                    .and_then(|e| e.get_password())
+                    .map(|p| !p.is_empty())
+                    .unwrap_or(false)
+            })
+            .collect())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn save_credential(id: String, secret: String) -> Result<()> {
+    blocking(move || {
+        let entry = keyring::Entry::new("ShellDock", &id).map_err(err)?;
+        if secret.is_empty() {
+            let _ = entry.delete_credential();
+        } else {
+            entry.set_password(&secret).map_err(err)?;
+        }
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn delete_credential(id: String) -> Result<()> {
+    blocking(move || {
+        if let Ok(entry) = keyring::Entry::new("ShellDock", &id) {
+            let _ = entry.delete_credential();
+        }
+        Ok(())
+    })
+    .await
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TestConnectionResult {
+    fingerprint: String,
+    previous: Option<String>,
+    trusted: bool,
+    authenticated: bool,
+    message: String,
+}
+
+#[tauri::command]
+async fn test_connection(
+    state: State<'_, Backend>,
+    connection: Connection,
+    secret: String,
+) -> Result<TestConnectionResult> {
+    connection.validate()?;
+    let previous = state
+        .store
+        .lock()
+        .map_err(err)?
+        .hosts
+        .get(&connection.endpoint())
+        .cloned();
+    blocking(move || {
+        let (session, fingerprint) = handshake(&connection)?;
+        let trusted = previous.as_deref() == Some(fingerprint.as_str());
+        if !trusted {
+            return Ok(TestConnectionResult {
+                fingerprint,
+                previous: previous.clone(),
+                trusted: false,
+                authenticated: false,
+                message: if previous.is_some() {
+                    "Host key changed from stored fingerprint.".into()
+                } else {
+                    "Reachable. Host key is not trusted yet; it will prompt on connect.".into()
+                },
+            });
+        }
+        let mut effective_secret = Zeroizing::new(secret);
+        if effective_secret.is_empty() {
+            if let Ok(entry) = keyring::Entry::new("ShellDock", &connection.id) {
+                if let Ok(password) = entry.get_password() {
+                    effective_secret = Zeroizing::new(password);
+                }
+            }
+        }
+        let ctx = Context {
+            connection,
+            secret: effective_secret,
+            fingerprint: fingerprint.clone(),
+        };
+        authenticate_session(session, &fingerprint, &ctx)?;
+        Ok(TestConnectionResult {
             fingerprint,
             previous,
+            trusted: true,
+            authenticated: true,
+            message: "Connected and authenticated successfully.".into(),
         })
     })
     .await
@@ -258,9 +409,11 @@ async fn connect(
         .get(&connection.endpoint())
         .cloned()
         .ok_or("Review and trust the host key first.")?;
+    let pending = take_pending_handshake(&state, &connection);
     let id = uuid::Uuid::new_v4().to_string();
     let live_id = id.clone();
     let sessions = state.sessions.clone();
+    let external_edits = state.external_edits.clone();
     let ctx = Arc::new(Context {
         connection,
         secret: Zeroizing::new(secret),
@@ -278,7 +431,10 @@ async fn connect(
                 }
             }
         }
-        let session = authenticate(&ctx)?;
+        let session = match pending {
+            Some((sess, fp)) => authenticate_session(sess, &fp, &ctx)?,
+            None => authenticate(&ctx)?,
+        };
         if remember && !ctx.secret.is_empty() {
             keyring::Entry::new("ShellDock", &ctx.connection.id)
                 .map_err(err)?
@@ -300,6 +456,7 @@ async fn connect(
             Live {
                 input: tx,
                 context: ctx.clone(),
+                sftp: Arc::new(Mutex::new(None)),
             },
         );
         thread::spawn(move || {
@@ -367,6 +524,7 @@ async fn connect(
             if let Ok(mut live) = sessions.lock() {
                 live.remove(&live_id);
             }
+            cleanup_session_edits(&external_edits, &live_id);
             let _ = output.send(TerminalEvent::Closed);
         });
         Ok(id)
@@ -397,237 +555,78 @@ fn terminal_resize(state: State<Backend>, id: String, cols: u32, rows: u32) -> R
         .send(Input::Resize(cols, rows))
         .map_err(err)
 }
+fn cleanup_session_edits(
+    edits: &Mutex<HashMap<String, sftp::ExternalEditHandle>>,
+    session_id: &str,
+) {
+    if let Ok(mut map) = edits.lock() {
+        let keys: Vec<String> = map
+            .iter()
+            .filter(|(_, h)| h.session_id == session_id)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in keys {
+            if let Some(handle) = map.remove(&key) {
+                handle
+                    .stop
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                let _ = fs::remove_dir_all(&handle.temp_dir);
+            }
+        }
+    }
+}
+
+fn sweep_stale_temp_dirs() {
+    let temp = std::env::temp_dir();
+    let Ok(entries) = fs::read_dir(temp) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !(name.starts_with("shelldock-drag-") || name.starts_with("shelldock-edit-")) {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata() {
+            if let Ok(modified) = meta.modified() {
+                if modified.elapsed().unwrap_or_default() > Duration::from_secs(7200) {
+                    let _ = fs::remove_dir_all(entry.path());
+                }
+            }
+        }
+    }
+}
+
 #[tauri::command]
 fn disconnect(state: State<Backend>, id: String) -> Result<()> {
     if let Some(live) = state.sessions.lock().map_err(err)?.remove(&id) {
         let _ = live.input.send(Input::Close);
     }
+    cleanup_session_edits(&state.external_edits, &id);
     Ok(())
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct FileEntry {
-    name: String,
-    path: String,
-    size: u64,
-    directory: bool,
-    symlink: bool,
-    modified: u64,
-}
-fn remote_entry(path: PathBuf, stat: FileStat) -> FileEntry {
-    FileEntry {
-        name: path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into(),
-        path: path.to_string_lossy().replace('\\', "/"),
-        size: stat.size.unwrap_or(0),
-        directory: stat.is_dir(),
-        symlink: stat.file_type() == ssh2::FileType::Symlink,
-        modified: stat.mtime.unwrap_or(0),
-    }
-}
-#[tauri::command]
-async fn list_remote(
-    state: State<'_, Backend>,
-    id: String,
-    path: String,
-) -> Result<Vec<FileEntry>> {
-    let ctx = context(&state, &id)?;
-    blocking(move || {
-        let session = authenticate(&ctx)?;
-        let sftp = session.sftp().map_err(err)?;
-        let mut files: Vec<_> = sftp
-            .readdir(Path::new(&path))
-            .map_err(err)?
-            .into_iter()
-            .filter(|(p, _)| !matches!(p.file_name().and_then(|v| v.to_str()), Some("." | "..")))
-            .map(|(p, s)| remote_entry(p, s))
-            .collect();
-        files.sort_by(|a, b| {
-            b.directory
-                .cmp(&a.directory)
-                .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-        });
-        Ok(files)
-    })
-    .await
-}
-#[tauri::command]
-async fn remote_home(state: State<'_, Backend>, id: String) -> Result<String> {
-    let ctx = context(&state, &id)?;
-    blocking(move || {
-        Ok(authenticate(&ctx)?
-            .sftp()
-            .map_err(err)?
-            .realpath(Path::new("."))
-            .map_err(err)?
-            .to_string_lossy()
-            .replace('\\', "/"))
-    })
-    .await
-}
-#[tauri::command]
-async fn remote_action(
-    state: State<'_, Backend>,
-    id: String,
-    action: String,
-    path: String,
-    destination: Option<String>,
-) -> Result<()> {
-    let ctx = context(&state, &id)?;
-    blocking(move || {
-        let session = authenticate(&ctx)?;
-        let sftp = session.sftp().map_err(err)?;
-        match action.as_str() {
-            "mkdir" => sftp.mkdir(Path::new(&path), 0o755).map_err(err),
-            "rename" => sftp
-                .rename(
-                    Path::new(&path),
-                    Path::new(&destination.ok_or("Destination required")?),
-                    Some(ssh2::RenameFlags::empty()),
-                )
-                .map_err(err),
-            "delete" => {
-                let stat = sftp.lstat(Path::new(&path)).map_err(err)?;
-                if stat.is_dir() {
-                    sftp.rmdir(Path::new(&path)).map_err(err)
-                } else {
-                    sftp.unlink(Path::new(&path)).map_err(err)
-                }
-            }
-            _ => Err("Unsupported file operation".into()),
-        }
-    })
-    .await
-}
-#[tauri::command]
-async fn read_remote(state: State<'_, Backend>, id: String, path: String) -> Result<String> {
-    let ctx = context(&state, &id)?;
-    blocking(move || {
-        let session = authenticate(&ctx)?;
-        let sftp = session.sftp().map_err(err)?;
-        let mut file = sftp.open(Path::new(&path)).map_err(err)?;
-        if file.stat().map_err(err)?.size.unwrap_or(0) > 2_000_000 {
-            return Err("Editor limit is 2 MB. Download this file instead.".into());
-        }
-        let mut text = String::new();
-        Read::by_ref(&mut file)
-            .take(2_000_001)
-            .read_to_string(&mut text)
-            .map_err(err)?;
-        if text.len() > 2_000_000 {
-            return Err("File exceeds editor limit.".into());
-        }
-        Ok(text)
-    })
-    .await
-}
-#[tauri::command]
-async fn write_remote(
-    state: State<'_, Backend>,
-    id: String,
-    path: String,
-    text: String,
-) -> Result<()> {
-    let ctx = context(&state, &id)?;
-    blocking(move || {
-        let session = authenticate(&ctx)?;
-        let sftp = session.sftp().map_err(err)?;
-        let mut file = sftp
-            .open_mode(
-                Path::new(&path),
-                ssh2::OpenFlags::WRITE | ssh2::OpenFlags::TRUNCATE,
-                0o644,
-                ssh2::OpenType::File,
-            )
-            .map_err(err)?;
-        file.write_all(text.as_bytes()).map_err(err)?;
-        file.fsync().map_err(err)
-    })
-    .await
-}
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct Progress {
-    completed: u64,
-    total: u64,
-}
-#[tauri::command]
-#[allow(clippy::too_many_arguments)] // Explicit IPC fields keep the frontend contract readable.
-async fn transfer(
-    state: State<'_, Backend>,
-    id: String,
-    local: String,
-    remote: String,
-    upload: bool,
-    replace: bool,
-    progress: Channel<Progress>,
-) -> Result<()> {
-    let ctx = context(&state, &id)?;
-    blocking(move || {
-        let session = authenticate(&ctx)?;
-        let sftp = session.sftp().map_err(err)?;
-        let (mut reader, mut writer, total): (Box<dyn Read>, Box<dyn Write>, u64) = if upload {
-            let source = fs::File::open(&local).map_err(err)?;
-            if !source.metadata().map_err(err)?.is_file() {
-                return Err(
-                    "This build supports file transfers; folder transfers are planned.".into(),
-                );
-            }
-            let total = source.metadata().map_err(err)?.len();
-            let flags = ssh2::OpenFlags::WRITE
-                | ssh2::OpenFlags::CREATE
-                | if replace {
-                    ssh2::OpenFlags::TRUNCATE
-                } else {
-                    ssh2::OpenFlags::EXCLUSIVE
-                };
-            let target = sftp
-                .open_mode(Path::new(&remote), flags, 0o644, ssh2::OpenType::File)
-                .map_err(err)?;
-            (Box::new(source), Box::new(target), total)
-        } else {
-            let source = sftp.open(Path::new(&remote)).map_err(err)?;
-            let total = sftp
-                .stat(Path::new(&remote))
-                .map_err(err)?
-                .size
-                .unwrap_or(0);
-            let target = fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .create_new(!replace)
-                .truncate(replace)
-                .open(&local)
-                .map_err(err)?;
-            (Box::new(source), Box::new(target), total)
-        };
-        let mut buffer = [0; 65536];
-        let mut completed = 0;
-        let mut last = std::time::Instant::now();
-        loop {
-            let n = reader.read(&mut buffer).map_err(err)?;
-            if n == 0 {
-                break;
-            }
-            writer.write_all(&buffer[..n]).map_err(err)?;
-            completed += n as u64;
-            if last.elapsed() > Duration::from_millis(100) {
-                let _ = progress.send(Progress { completed, total });
-                last = std::time::Instant::now();
-            }
-        }
-        writer.flush().map_err(err)?;
-        let _ = progress.send(Progress { completed, total });
-        Ok(())
-    })
-    .await
+pub struct FileEntry {
+    pub name: String,
+    pub path: String,
+    pub size: u64,
+    pub directory: bool,
+    pub symlink: bool,
+    pub modified: u64,
+    pub permissions: Option<u32>,
 }
 
 pub fn run() {
+    sweep_stale_temp_dirs();
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
         .manage(Backend::default())
         .setup(|app| {
@@ -650,20 +649,30 @@ pub fn run() {
             delete_connection,
             probe_host,
             trust_host,
+            list_saved_credentials,
+            save_credential,
+            delete_credential,
+            test_connection,
             connect,
             terminal_write,
             terminal_resize,
             disconnect,
-            list_remote,
-            remote_home,
-            remote_action,
-            read_remote,
-            write_remote,
-            transfer,
+            sftp::list_remote,
+            sftp::remote_home,
+            sftp::remote_action,
+            sftp::remote_delete_batch,
+            sftp::read_remote,
+            sftp::write_remote,
+            sftp::open_remote_external,
+            sftp::stop_remote_external,
             files::list_local,
             files::local_action,
             files::transfer_batch,
-            files::cancel_transfer
+            files::cancel_transfer,
+            drag_out::list_local_places,
+            drag_out::open_local_default,
+            drag_out::reveal_local,
+            drag_out::start_external_drag
         ])
         .build(tauri::generate_context!())
         .expect("Unable to initialize ShellDock")
@@ -673,6 +682,14 @@ pub fn run() {
                 if let Ok(mut sessions) = state.sessions.lock() {
                     for (_, live) in sessions.drain() {
                         let _ = live.input.send(Input::Close);
+                    }
+                };
+                if let Ok(mut edits) = state.external_edits.lock() {
+                    for (_, handle) in edits.drain() {
+                        handle
+                            .stop
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                        let _ = fs::remove_dir_all(&handle.temp_dir);
                     }
                 };
             }
@@ -819,6 +836,7 @@ mod tests {
             destination: "/".into(),
             upload: true,
             policy: "skip".into(),
+            verify: true,
         };
         let uploaded = files::run_batch(&ctx, &request, &cancel, |_| {}).unwrap();
         assert_eq!(uploaded.completed_files, 2);
@@ -834,6 +852,7 @@ mod tests {
             destination: destination.path().to_string_lossy().into(),
             upload: false,
             policy: "skip".into(),
+            verify: true,
         };
         let received = files::run_batch(&ctx, &download, &cancel, |_| {}).unwrap();
         assert_eq!(received.completed_files, 2);
@@ -884,6 +903,7 @@ mod tests {
             destination: "/".into(),
             upload: true,
             policy: "replace".into(),
+            verify: true,
         };
         assert!(files::run_batch(&ctx, &corrupt_request, &cancel, |_| {})
             .unwrap_err()
@@ -901,6 +921,7 @@ mod tests {
             destination: "/".into(),
             upload: true,
             policy: "replace".into(),
+            verify: true,
         };
         assert!(files::run_batch(&ctx, &rejected, &cancel, |_| {})
             .unwrap_err()
@@ -933,6 +954,42 @@ mod tests {
         assert!(files::run_batch(&ctx, &request, &cancel, |_| {})
             .unwrap_err()
             .contains("cancelled"));
+        // Verify recursive deletion removes non-empty directories via SFTP RMDIR + UNLINK.
+        assert!(sftp.rmdir(Path::new("/project")).is_err());
+        sftp::delete_remote_entry(&sftp, "/project", 0).unwrap();
+        assert!(sftp.stat(Path::new("/project")).is_err());
+        assert!(sftp::delete_remote_entry(&sftp, "/", 0).is_err());
+        // Verify remote YAML editor roundtrip, binary detection, and conflict protection.
+        let yaml_res =
+            sftp::write_remote_sftp(&sftp, "/app.yml", b"service:\n  port: 8080\n", None, false)
+                .map_err(|e| e.to_string())
+                .unwrap();
+        let read_back = sftp::read_remote_sftp(&sftp, "/app.yml", None)
+            .map_err(|e| e.to_string())
+            .unwrap();
+        assert_eq!(read_back.text, "service:\n  port: 8080\n");
+        assert!(!read_back.binary);
+        assert!(sftp::write_remote_sftp(
+            &sftp,
+            "/app.yml",
+            b"updated",
+            Some(yaml_res.mtime.unwrap_or(0) + 99),
+            false,
+        )
+        .err()
+        .unwrap()
+        .to_string()
+        .starts_with("CONFLICT:"));
+        sftp::write_remote_sftp(&sftp, "/app.yml", b"service:\n  port: 9090\n", None, true)
+            .map_err(|e| e.to_string())
+            .unwrap();
+        assert_eq!(
+            sftp::read_remote_sftp(&sftp, "/app.yml", None)
+                .map_err(|e| e.to_string())
+                .unwrap()
+                .text,
+            "service:\n  port: 9090\n"
+        );
         ctx.fingerprint = "SHA256:wrong-host-key".into();
         assert!(authenticate(&ctx)
             .err()

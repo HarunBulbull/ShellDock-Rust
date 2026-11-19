@@ -27,9 +27,12 @@ async function mockDesktop(page: Page) {
       directory,
       symlink: false,
       modified: 1700000000,
+      permissions: directory ? 0o755 : 0o644,
     });
     Object.assign(window, {
       __commands: commands,
+      __savedCreds: [] as string[],
+      __trustedFp: null as string | null,
       __drop: (paths: string[], x: number, y: number) => {
         for (const { event, handler } of listeners.values())
           if (event === "tauri://drag-drop")
@@ -64,15 +67,38 @@ async function mockDesktop(page: Page) {
             return;
           }
           if (cmd === "list_connections") return saved;
+          if (cmd === "list_saved_credentials")
+            return (window as any).__savedCreds;
+          if (cmd === "save_credential" || cmd === "delete_credential") return;
           if (cmd === "probe_host")
-            return { fingerprint: "SHA256:test-fingerprint", previous: null };
+            return {
+              fingerprint: "SHA256:test-fingerprint",
+              previous: (window as any).__trustedFp,
+            };
+          if (cmd === "trust_host") {
+            (window as any).__trustedFp = args.fingerprint;
+            return;
+          }
           if (cmd === "connect") return `session-${++seq}`;
           if (cmd === "remote_home") return "/home/tester";
           if (cmd === "list_remote")
-            return [
-              entry("uploads", `${args.path}/uploads`, true),
-              entry("hello.txt", `${args.path}/hello.txt`),
-            ];
+            return {
+              path: args.path,
+              parent: args.path === "/" ? null : "/home",
+              entries: [
+                entry("uploads", `${args.path}/uploads`, true),
+                entry("docker-compose.yml", `${args.path}/docker-compose.yml`),
+                entry("hello.txt", `${args.path}/hello.txt`),
+              ],
+            };
+          if (cmd === "list_local_places")
+            return {
+              home: "C:\\Users\\tester",
+              desktop: "C:\\Users\\tester\\Desktop",
+              downloads: "C:\\Users\\tester\\Downloads",
+              documents: "C:\\Users\\tester\\Documents",
+              drives: [{ path: "C:\\", label: "C:" }],
+            };
           if (cmd === "list_local") {
             const path = args.path || "C:\\Users\\tester\\Desktop";
             return {
@@ -85,6 +111,35 @@ async function mockDesktop(page: Page) {
               ],
             };
           }
+          if (cmd === "read_remote")
+            return {
+              path: args.path,
+              text: "services:\n  web:\n    image: nginx\n",
+              mtime: 1700000100,
+              size: 35,
+              permissions: 0o644,
+              readOnly: false,
+              readOnlyReason: null,
+              truncated: false,
+              previewMode: null,
+              lossyUtf8: false,
+              binary: false,
+              lineEnding: "LF",
+            };
+          if (cmd === "write_remote") {
+            if ((window as any).__conflictWrite && !args.force)
+              throw new Error("CONFLICT:File changed on server.");
+            return { mtime: 1700000200, size: args.text.length };
+          }
+          if (cmd === "remote_delete_batch") {
+            if ((window as any).__partialDeleteFail) {
+              return {
+                deleted: [args.paths[0]],
+                failed: [{ path: args.paths[1], error: "Permission denied" }],
+              };
+            }
+            return { deleted: args.paths, failed: [] };
+          }
           if (cmd === "transfer_batch") {
             const result = {
               completedBytes: 2400,
@@ -94,9 +149,11 @@ async function mockDesktop(page: Page) {
               skippedFiles: (window as any).__skipAll ? 2 : 0,
               current: "",
               status: "completed",
+              bytesPerSec: 12000,
             };
             args.progress.onmessage({
               ...result,
+              completedBytes: 1200,
               status: "transferring",
               completedFiles: 0,
             });
@@ -109,6 +166,8 @@ async function mockDesktop(page: Page) {
             return result;
           }
           if (cmd === "save_connection") {
+            if ((window as any).__failSave)
+              throw new Error("Save validation failed");
             saved.push(args.connection);
             return;
           }
@@ -143,7 +202,7 @@ test("original-style empty workspace and desktop-only connection storage", async
   ).toBeVisible();
   await expect(
     page.getByText(
-      "Choose a server in the sidebar, then double-click to open a session.",
+      "Choose a server in the sidebar, then double-click to connect automatically.",
     ),
   ).toBeVisible();
   await page
@@ -178,7 +237,7 @@ test("queued uploads survive switching away from the session tab", async ({
   await page
     .getByRole("navigation")
     .getByRole("button", { name: "Integration server" })
-    .dblclick();
+    .dblclick({ modifiers: ["Shift"] });
   await page
     .locator(".tab-bar .tab")
     .first()
@@ -250,10 +309,18 @@ test("native-style split panels, explicit host trust and independent tabs", asyn
   await expect(remote).toBeHidden();
   await page.getByRole("button", { name: "Both", exact: true }).click();
   await expect(remote).toBeVisible();
+  // Normal double-click focuses existing tab; Shift+double-click opens a second tab.
   await page
     .getByRole("navigation")
     .getByRole("button", { name: "Integration server" })
     .dblclick();
+  await expect(
+    page.getByRole("button", { name: "Close Integration server" }),
+  ).toHaveCount(1);
+  await page
+    .getByRole("navigation")
+    .getByRole("button", { name: "Integration server" })
+    .dblclick({ modifiers: ["Shift"] });
   await expect(
     page.getByRole("button", { name: "Close Integration server" }),
   ).toHaveCount(2);
@@ -482,4 +549,145 @@ test("skipped uploads never claim files were transferred", async ({ page }) => {
   await expect(
     page.getByText("Transfer complete", { exact: false }),
   ).toHaveCount(0);
+});
+
+test("auto-connects on double-click when credential is saved and focuses existing tab", async ({
+  page,
+}) => {
+  await mockDesktop(page);
+  await page.addInitScript(() => {
+    (window as any).__savedCreds = ["test"];
+    (window as any).__trustedFp = "SHA256:test-fingerprint";
+  });
+  await page.goto("/");
+  await page
+    .getByRole("navigation")
+    .getByRole("button", { name: "Integration server" })
+    .dblclick();
+  await expect(page.getByText("1 active sessions")).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Connect to server" }),
+  ).toBeHidden();
+  await page
+    .getByRole("navigation")
+    .getByRole("button", { name: "Integration server" })
+    .dblclick();
+  await expect(
+    page.getByRole("button", { name: "Close Integration server" }),
+  ).toHaveCount(1);
+});
+
+test("remote files can be dragged to local folders and bulk-deleted via single batch", async ({
+  page,
+}) => {
+  await mockDesktop(page);
+  await page.goto("/");
+  await connect(page);
+  const remote = page.getByRole("listbox", { name: "Remote directory" });
+  const local = page.getByRole("listbox", { name: "Local directory" });
+  await remote
+    .getByRole("option", { name: /hello.txt/ })
+    .dragTo(local.getByRole("option", { name: /project/ }));
+  await expect(
+    page.getByRole("heading", { name: "Download 1 item", exact: true }),
+  ).toBeVisible();
+  await expect(page.getByRole("dialog").getByRole("textbox")).toHaveValue(
+    "C:\\Users\\tester\\Desktop\\project",
+  );
+  await page.getByRole("button", { name: "Cancel", exact: true }).click();
+
+  // Bulk delete two remote items uses remote_delete_batch and keeps failures inside modal.
+  await page.evaluate(() => ((window as any).__partialDeleteFail = true));
+  await remote.getByRole("option", { name: /hello.txt/ }).click();
+  await remote
+    .getByRole("option", { name: /uploads/ })
+    .click({ modifiers: ["Control"] });
+  await page.keyboard.press("Delete");
+  const dialog = page.getByRole("dialog", { name: "File operation" });
+  await expect(dialog.getByRole("heading")).toHaveText("Delete remote items?");
+  await dialog.getByRole("button", { name: "Confirm" }).click();
+  await expect(dialog.getByRole("alert")).toContainText("Permission denied");
+  await dialog.getByRole("button", { name: "Cancel" }).click();
+  expect(
+    await page.evaluate(
+      () =>
+        (window as any).__commands.filter(
+          (c: any) => c.cmd === "remote_delete_batch",
+        ).length,
+    ),
+  ).toBe(1);
+});
+
+test("MobaXterm-style YAML editor opens on double-click, indents with Tab, saves cleanly, and supports split view", async ({
+  page,
+}) => {
+  await mockDesktop(page);
+  const dialogs: string[] = [];
+  page.on("dialog", async (d) => {
+    dialogs.push(d.message());
+    await d.accept();
+  });
+  await page.goto("/");
+  await connect(page);
+  const remote = page.getByRole("listbox", { name: "Remote directory" });
+  await remote.getByRole("option", { name: /docker-compose\.yml/ }).dblclick();
+  const editor = page.getByRole("region", {
+    name: "Remote editor for docker-compose.yml",
+  });
+  await expect(editor).toBeVisible();
+  await expect(editor.locator(".editor-badge").first()).toHaveText("YAML");
+
+  // Unmodified file closes without any confirmation popup.
+  await editor.getByRole("button", { name: "Close file" }).click();
+  await expect(editor).toBeHidden();
+  expect(dialogs).toEqual([]);
+
+  // Reopen, toggle split view with terminal, type Tab & Ctrl+S.
+  await remote.getByRole("option", { name: /docker-compose\.yml/ }).dblclick();
+  await editor.getByRole("button", { name: /Split/ }).click();
+  await expect(page.locator(".terminal-pane")).toBeVisible();
+  const cmContent = editor.locator(".cm-content");
+  await cmContent.click();
+  await page.keyboard.press("Tab");
+  await expect(editor.getByRole("button", { name: /Save/ })).toBeEnabled();
+  await page.keyboard.press("Control+s");
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (window as any).__commands.filter(
+            (c: any) => c.cmd === "write_remote",
+          ).length,
+      ),
+    )
+    .toBe(1);
+  expect(dialogs).toEqual([]);
+});
+
+test("modals close on Escape without leaking errors and sidebar groups collapse", async ({
+  page,
+}) => {
+  await mockDesktop(page);
+  await page.goto("/");
+  await page.evaluate(() => ((window as any).__failSave = true));
+  await page
+    .getByRole("button", { name: "New Connection", exact: true })
+    .click();
+  await page.getByPlaceholder("Production server").fill("Test");
+  await page.getByPlaceholder("192.168.1.10 or example.com").fill("1.2.3.4");
+  await page.getByPlaceholder("root").fill("root");
+  await page.getByRole("button", { name: "Save connection" }).click();
+  await expect(page.getByRole("dialog").getByRole("alert")).toContainText(
+    "Save validation failed",
+  );
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("dialog")).toBeHidden();
+  await expect(page.locator("main > .error")).toHaveCount(0);
+
+  await page.getByRole("button", { name: /Development/ }).click();
+  await expect(
+    page
+      .getByRole("navigation")
+      .getByRole("button", { name: "Integration server" }),
+  ).toBeHidden();
 });

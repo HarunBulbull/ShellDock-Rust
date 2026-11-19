@@ -54,6 +54,7 @@ fn browse(path: &Path) -> Result<LocalDirectory> {
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                 .map(|t| t.as_secs())
                 .unwrap_or(0),
+            permissions: None,
         });
     }
     entries.sort_by(|a, b| {
@@ -80,12 +81,92 @@ pub async fn list_local(path: Option<String>) -> Result<LocalDirectory> {
     .await
 }
 
+fn available_local_destination(directory: &Path, item_name: &str) -> PathBuf {
+    let initial = directory.join(item_name);
+    if fs::symlink_metadata(&initial).is_err() {
+        return initial;
+    }
+    let path = Path::new(item_name);
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(item_name);
+    let ext = path.extension().and_then(|e| e.to_str());
+    let mut index = 2usize;
+    loop {
+        let candidate_name = match ext {
+            Some(ext) if !ext.is_empty() => format!("{stem} copy {index}.{ext}"),
+            _ => format!("{stem} copy {index}"),
+        };
+        let candidate = directory.join(candidate_name);
+        if fs::symlink_metadata(&candidate).is_err() {
+            return candidate;
+        }
+        index += 1;
+    }
+}
+
+fn copy_local_recursive(source: &Path, destination: &Path, depth: usize) -> Result<()> {
+    if depth > 128 {
+        return Err("Folder copy exceeds maximum nesting depth.".into());
+    }
+    let metadata = fs::symlink_metadata(source).map_err(err)?;
+    if linked(&metadata) {
+        return Ok(());
+    }
+    if metadata.is_dir() {
+        fs::create_dir_all(destination).map_err(err)?;
+        for entry in fs::read_dir(source).map_err(err)? {
+            let entry = entry.map_err(err)?;
+            let name = entry.file_name();
+            copy_local_recursive(&entry.path(), &destination.join(name), depth + 1)?;
+        }
+    } else if metadata.is_file() {
+        fs::copy(source, destination).map_err(err)?;
+    }
+    Ok(())
+}
+
 fn local_operation(action: &str, paths: &[String], name: Option<&str>) -> Result<()> {
     if paths.is_empty() {
         return Err("Select an item.".into());
     }
     if action == "rename" && paths.len() != 1 {
         return Err("Select one item to rename.".into());
+    }
+    if action == "mkdir" {
+        let parent = Path::new(&paths[0]);
+        if !parent.is_dir() {
+            return Err("Target local directory does not exist.".into());
+        }
+        let folder_name = name.ok_or("Folder name required.")?;
+        download_name(folder_name)?;
+        let target = parent.join(folder_name);
+        if fs::symlink_metadata(&target).is_ok() {
+            return Err("An item with this name already exists.".into());
+        }
+        fs::create_dir(&target).map_err(err)?;
+        return Ok(());
+    }
+    if action == "copy" {
+        let target_dir = Path::new(name.ok_or("Destination folder required.")?);
+        if !target_dir.is_dir() {
+            return Err("Destination local folder does not exist.".into());
+        }
+        for value in paths {
+            let source = Path::new(value);
+            if source.parent() == Some(target_dir) {
+                continue;
+            }
+            let item_name = source
+                .file_name()
+                .and_then(|v| v.to_str())
+                .ok_or("Cannot copy a filesystem root.")?;
+            download_name(item_name)?;
+            let destination = available_local_destination(target_dir, item_name);
+            copy_local_recursive(source, &destination, 0)?;
+        }
+        return Ok(());
     }
     for value in paths {
         let path = Path::new(value);
@@ -124,6 +205,10 @@ pub async fn local_action(action: String, paths: Vec<String>, name: Option<Strin
     blocking(move || local_operation(&action, &paths, name.as_deref())).await
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BatchRequest {
@@ -132,6 +217,8 @@ pub struct BatchRequest {
     pub destination: String,
     pub upload: bool,
     pub policy: String,
+    #[serde(default = "default_true")]
+    pub verify: bool,
 }
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -143,6 +230,7 @@ pub struct BatchProgress {
     pub skipped_files: u64,
     pub current: String,
     pub status: String,
+    pub bytes_per_sec: u64,
 }
 struct Item {
     local: PathBuf,
@@ -160,7 +248,7 @@ fn check(cancel: &AtomicBool) -> Result<()> {
 fn remote_join(base: &str, name: &str) -> String {
     format!("{}/{}", base.trim_end_matches('/'), name)
 }
-fn staging_path(destination: &str, extension: &str) -> String {
+pub fn staging_path(destination: &str, extension: &str) -> String {
     let parent = destination
         .rsplit_once('/')
         .map(|(parent, _)| parent)
@@ -170,7 +258,7 @@ fn staging_path(destination: &str, extension: &str) -> String {
         &format!(".shelldock-{}.{extension}", uuid::Uuid::new_v4()),
     )
 }
-fn name(path: &str) -> Result<&str> {
+pub fn remote_item_name(path: &str) -> Result<&str> {
     let value = path
         .rsplit('/')
         .find(|s| !s.is_empty())
@@ -184,7 +272,7 @@ fn validate_name(value: &str) -> Result<()> {
     }
     Ok(())
 }
-fn download_name(value: &str) -> Result<()> {
+pub fn download_name(value: &str) -> Result<()> {
     validate_name(value)?;
     #[cfg(windows)]
     {
@@ -201,7 +289,7 @@ fn download_name(value: &str) -> Result<()> {
     }
     Ok(())
 }
-fn remote_stat(sftp: &Sftp, path: &str) -> Result<Option<ssh2::FileStat>> {
+pub fn remote_stat(sftp: &Sftp, path: &str) -> Result<Option<ssh2::FileStat>> {
     match sftp.lstat(Path::new(path)) {
         Ok(s) => Ok(Some(s)),
         Err(e) if matches!(e.code(), ssh2::ErrorCode::SFTP(2 | 10)) => Ok(None),
@@ -315,6 +403,7 @@ fn copy_stream(
     reader: &mut dyn Read,
     writer: &mut dyn Write,
     state: &mut BatchProgress,
+    started: Instant,
     cancel: &AtomicBool,
     report: &mut impl FnMut(&BatchProgress),
 ) -> Result<()> {
@@ -329,13 +418,22 @@ fn copy_stream(
         writer.write_all(&bytes[..n]).map_err(err)?;
         state.completed_bytes += n as u64;
         if last.elapsed().as_millis() >= 100 {
+            let secs = started.elapsed().as_secs_f64();
+            if secs > 0.05 {
+                state.bytes_per_sec = (state.completed_bytes as f64 / secs) as u64;
+            }
             report(state);
             last = Instant::now();
         }
     }
     writer.flush().map_err(err)
 }
-fn commit_remote(sftp: &Sftp, temp: &str, destination: &str, replace_existing: bool) -> Result<()> {
+pub fn commit_remote(
+    sftp: &Sftp,
+    temp: &str,
+    destination: &str,
+    replace_existing: bool,
+) -> Result<()> {
     if !replace_existing {
         return sftp
             .rename(
@@ -455,7 +553,7 @@ pub fn run_batch(
                 0,
             )?;
         } else {
-            let filename = name(source)?;
+            let filename = remote_item_name(source)?;
             download_name(filename)?;
             if !roots.insert(filename.to_owned()) {
                 return Err("Selected roots have duplicate names.".into());
@@ -475,6 +573,7 @@ pub fn run_batch(
     state.total_bytes = items.iter().filter(|i| !i.directory).map(|i| i.size).sum();
     state.status = "transferring".into();
     report(&state);
+    let transfer_started = Instant::now();
     let result = (|| -> Result<()> {
         for item in &items {
             check(cancel)?;
@@ -531,7 +630,14 @@ pub fn run_batch(
                             ssh2::OpenType::File,
                         )
                         .map_err(err)?;
-                    copy_stream(&mut source, &mut target, &mut state, cancel, &mut report)?;
+                    copy_stream(
+                        &mut source,
+                        &mut target,
+                        &mut state,
+                        transfer_started,
+                        cancel,
+                        &mut report,
+                    )?;
                     target.close().map_err(err)?;
                     check(cancel)?;
                     commit_remote(
@@ -545,12 +651,14 @@ pub fn run_batch(
                     let _ = sftp.unlink(Path::new(&temp));
                 }
                 copied?;
-                // A successful write/rename response alone is not proof that the
-                // requested destination contains the bytes that were selected.
-                state.status = "verifying".into();
-                report(&state);
-                verify_upload(&sftp, item, cancel)?;
-                state.status = "transferring".into();
+                if request.verify {
+                    // A successful write/rename response alone is not proof that the
+                    // requested destination contains the bytes that were selected.
+                    state.status = "verifying".into();
+                    report(&state);
+                    verify_upload(&sftp, item, cancel)?;
+                    state.status = "transferring".into();
+                }
             } else {
                 if let Ok(metadata) = fs::symlink_metadata(&item.local) {
                     if linked(&metadata) || !metadata.is_file() {
@@ -572,15 +680,21 @@ pub fn run_batch(
                         .create_new(true)
                         .open(&temp)
                         .map_err(err)?;
-                    copy_stream(&mut source, &mut target, &mut state, cancel, &mut report)?;
+                    copy_stream(
+                        &mut source,
+                        &mut target,
+                        &mut state,
+                        transfer_started,
+                        cancel,
+                        &mut report,
+                    )?;
                     target.sync_all().map_err(err)?;
                     drop(target);
                     check(cancel)?;
-                    if request.policy == "replace" {
+                    if request.policy == "replace" || fs::symlink_metadata(&item.local).is_err() {
                         fs::rename(&temp, &item.local).map_err(err)
                     } else {
-                        fs::hard_link(&temp, &item.local).map_err(err)?;
-                        fs::remove_file(&temp).map_err(err)
+                        Err("Destination file appeared during transfer.".into())
                     }
                 })();
                 if copied.is_err() {
@@ -692,5 +806,32 @@ mod tests {
         assert!(!folder.exists());
         assert_eq!(fs::read(kept).unwrap(), b"do not overwrite");
         assert!(local_operation("delete", &[String::from("C:\\")], None).is_err());
+    }
+    #[test]
+    fn local_mkdir_and_copy_keep_existing_files() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let file = src.path().join("notes.yml");
+        fs::write(&file, b"a: 1").unwrap();
+        local_operation("mkdir", &[dst.path().to_string_lossy().into()], Some("sub")).unwrap();
+        assert!(dst.path().join("sub").is_dir());
+        local_operation(
+            "copy",
+            &[file.to_string_lossy().into()],
+            Some(&dst.path().to_string_lossy()),
+        )
+        .unwrap();
+        fs::write(dst.path().join("notes.yml"), b"existing").unwrap();
+        local_operation(
+            "copy",
+            &[file.to_string_lossy().into()],
+            Some(&dst.path().to_string_lossy()),
+        )
+        .unwrap();
+        assert_eq!(fs::read(dst.path().join("notes.yml")).unwrap(), b"existing");
+        assert_eq!(
+            fs::read(dst.path().join("notes copy 2.yml")).unwrap(),
+            b"a: 1"
+        );
     }
 }
