@@ -672,7 +672,7 @@ export default function App() {
           }}
         >
           <Server size={16} />
-          <span>
+          <span className="connection-info">
             <strong>{c.name}</strong>
             <small>
               {c.username}@{c.host}
@@ -820,7 +820,7 @@ export default function App() {
           <button onClick={() => setSettings(true)}>
             <Settings size={16} /> Settings & about
           </button>
-          <span className="small muted">v0.2.2 · Windows</span>
+          <span className="small muted">v0.2.3 · Windows</span>
         </div>
       </aside>
       <main className="main">
@@ -1803,7 +1803,7 @@ export default function App() {
             className="modal narrow"
           >
             <h2>ShellDock for Windows</h2>
-            <p>Version 0.2.2</p>
+            <p>Version 0.2.3</p>
             <p className="muted">
               Tauri 2 · React · Rust · libssh2 · xterm.js · CodeMirror 6
             </p>

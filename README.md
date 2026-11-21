@@ -7,18 +7,18 @@
 
 Sunucularınızı, SSH oturumlarınızı ve yerel/uzak dosyalarınızı tek çalışma alanında yönetin. Orijinal ShellDock düzenindeki sunucu listesi, terminal ve Remote / Local / Both dosya panelleri Windows için uyarlandı.
 
-**v0.2.2 bir geliştirme önizlemesidir.** Kayıtlı şifreyle tek tıkla/çift tıklamayla otomatik bağlanma, çift yönlü sürükle-bırak, MobaXterm tarzı indirmeden uzaktan dosya düzenleme ve özyinelemeli toplu uzak silme eklenmiştir; macOS sürümüyle tam özellik eşitliği henüz sağlanmadı. [Eksikler ve yol haritası](docs/PARITY.md).
+**v0.2.3 bir geliştirme önizlemesidir.** Kayıtlı şifreyle tek tıkla/çift tıklamayla otomatik bağlanma, çift yönlü sürükle-bırak, sınırsız/asenkron Windows Masaüstü/Explorer dışa sürükleme, MobaXterm tarzı indirmeden uzaktan dosya düzenleme ve özyinelemeli toplu uzak silme içerir; macOS sürümüyle tam özellik eşitliği henüz sağlanmadı. [Eksikler ve yol haritası](docs/PARITY.md).
 
 ## Windows için indir
 
 | Paket                                     | İndirme                                                                                                                                    |
 | ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| Windows x64 kurulum dosyası               | [ShellDock_0.2.2_x64-setup.exe](https://github.com/HarunBulbull/ShellDock-Rust/releases/download/v0.2.2/ShellDock_0.2.2_x64-setup.exe)     |
-| Taşınabilir paket — uygulama ve lisanslar | [ShellDock_0.2.2_windows-x64.zip](https://github.com/HarunBulbull/ShellDock-Rust/releases/download/v0.2.2/ShellDock_0.2.2_windows-x64.zip) |
-| Doğrudan çalıştırılabilir uygulama        | [ShellDock_0.2.2_windows-x64.exe](https://github.com/HarunBulbull/ShellDock-Rust/releases/download/v0.2.2/ShellDock_0.2.2_windows-x64.exe) |
-| SHA-256 doğrulama değerleri               | [SHA256SUMS.txt](https://github.com/HarunBulbull/ShellDock-Rust/releases/download/v0.2.2/SHA256SUMS.txt)                                   |
+| Windows x64 kurulum dosyası               | [ShellDock_0.2.3_x64-setup.exe](https://github.com/HarunBulbull/ShellDock-Rust/releases/download/v0.2.3/ShellDock_0.2.3_x64-setup.exe)     |
+| Taşınabilir paket — uygulama ve lisanslar | [ShellDock_0.2.3_windows-x64.zip](https://github.com/HarunBulbull/ShellDock-Rust/releases/download/v0.2.3/ShellDock_0.2.3_windows-x64.zip) |
+| Doğrudan çalıştırılabilir uygulama        | [ShellDock_0.2.3_windows-x64.exe](https://github.com/HarunBulbull/ShellDock-Rust/releases/download/v0.2.3/ShellDock_0.2.3_windows-x64.exe) |
+| SHA-256 doğrulama değerleri               | [SHA256SUMS.txt](https://github.com/HarunBulbull/ShellDock-Rust/releases/download/v0.2.3/SHA256SUMS.txt)                                   |
 
-[Sürüm notları ve tüm dosyalar](https://github.com/HarunBulbull/ShellDock-Rust/releases/tag/v0.2.2)
+[Sürüm notları ve tüm dosyalar](https://github.com/HarunBulbull/ShellDock-Rust/releases/tag/v0.2.3)
 
 Windows 10/11 x64 ve Microsoft Edge WebView2 Runtime gerekir. Hazır paketleri kullanmak için Rust, Node.js, Perl veya Visual Studio kurmanız gerekmez. Taşınabilir ZIP'i bir klasöre çıkarıp `ShellDock.exe` dosyasını açabilirsiniz.
 
@@ -26,7 +26,7 @@ Dosyalar kod imzalı değildir. Dosya transferleri geçici hedef kullanır; değ
 
 ![Windows uygulamasının gerçek WebView2 ekranı](docs/screenshots/windows-files-native.png)
 
-Gerçek WebView2 dosya yöneticisi, SFTP havuzu ve uzaktan editör akışı yalıtılmış profilde otomatik testten geçti. Test kapsamı ve sınırlar: [v0.2.2 doğrulama kaydı](docs/VALIDATION_v0.2.2.md).
+Gerçek WebView2 dosya yöneticisi, SFTP havuzu ve uzaktan editör akışı yalıtılmış profilde otomatik testten geçti. Test kapsamı ve sınırlar: [v0.2.3 doğrulama kaydı](docs/VALIDATION_v0.2.3.md).
 
 ## Kaynaktan geliştirme
 
@@ -86,11 +86,11 @@ npm.cmd run tauri build
 npm.cmd run test:desktop
 ```
 
-- TypeScript/Vite üretim derlemesi ve 13 Playwright testi yerelde geçti.
-- Playwright gerçek Chromium kullanır; masaüstü IPC'sini taklit ederek otomatik bağlanma, çift yönlü sürükleme, toplu silme, CodeMirror uzaktan düzenleyici, sekme odaklama ve grup katlamayı denetler. Bu, gerçek SSH taşıma testi değildir.
-- 10 Rust testi Windows üzerinde geçti: bağlantı doğrulama, kalıcılık, credential saklama/okuma/silme, yerel/uzak rekürsif silme, uzaktan okuma/yazma çakışma kontrolü ve geçici loopback sunucusuyla gerçek SSH/SFTP protokol testi dahil.
+- TypeScript/Vite üretim derlemesi ve 14 Playwright testi yerelde geçti.
+- Playwright gerçek Chromium kullanır; masaüstü IPC'sini taklit ederek otomatik bağlanma, çift yönlü sürükleme, dışa sürükleme tetiklemesi, kenar çubuğu durum göstergesi, toplu silme, CodeMirror uzaktan düzenleyici, sekme odaklama ve grup katlamayı denetler. Bu, gerçek SSH taşıma testi değildir.
+- 12 Rust testi Windows üzerinde geçti: bağlantı doğrulama, kalıcılık, credential saklama/okuma/silme, yerel/uzak rekürsif silme, 2.200+ öğeli klasör ağacı + >2 MB akışlı indirme, Windows Shell `IDropTarget` + MTA asenkron dışa bırakma testi ve geçici loopback sunucusuyla gerçek SSH/SFTP protokol testi dahil.
 - Clippy `--all-targets -- -D warnings` kontrolü geçti.
-- Ayrı, geçici uygulama profilinde gerçek WebView2 + Rust IPC ile `smoke-files.cjs` geçti: yerel → uzak yükleme, bayt doğrulama, uzak → yerel sürükleme, uzaktan editörde `Ctrl+S` kaydetme ve özyinelemeli toplu uzak silme doğrulandı. Uzak panelden fiziksel Windows Explorer penceresine dışa sürükleme (`DoDragDrop`) yalnızca derleme ve statik denetimden geçti; masaüstünde ayrıca elle denenmelidir.
+- Ayrı, geçici uygulama profilinde gerçek WebView2 + Rust IPC ile `smoke-files.cjs` akışı doğrulanır; gerçek masaüstünde fiziksel fareyle Windows Explorer penceresine sürükle-bırak ayrıca elle denenmelidir.
 - Test sunucusu yalnızca `127.0.0.1` üzerinde rastgele portta, geçici RSA/Ed25519 anahtarları ve bellekte dosyalarla çalışır; gerçek sunucu olarak kullanılmaz.
 - [Windows CI](https://github.com/HarunBulbull/ShellDock-Rust/actions/workflows/windows.yml) ve etiket tabanlı [Release Windows](.github/workflows/release.yml) akışları GitHub üzerinde derleme ve paketleme çalıştırır.
 

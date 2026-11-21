@@ -245,9 +245,20 @@ kbd {
   padding: 10px;
   color: #8d9aac;
 }
-.connection-open > span {
+.connection-open:hover {
+  background: transparent;
+}
+.connection-open > svg {
+  flex-shrink: 0;
+}
+.connection-open > .connection-info {
   flex: 1;
   min-width: 0;
+}
+.connection-open > .status-dot {
+  flex: 0 0 6px;
+  width: 6px;
+  height: 6px;
 }
 .connection-open strong {
   display: block;

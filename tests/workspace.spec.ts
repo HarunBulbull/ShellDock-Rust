@@ -33,6 +33,11 @@ async function mockDesktop(page: Page) {
       __commands: commands,
       __savedCreds: [] as string[],
       __trustedFp: null as string | null,
+      __emit: (targetEvent: string, payload: unknown) => {
+        for (const { event, handler } of listeners.values())
+          if (event === targetEvent)
+            callbacks.get(handler)?.({ event, payload });
+      },
       __drop: (paths: string[], x: number, y: number) => {
         for (const { event, handler } of listeners.values())
           if (event === "tauri://drag-drop")
@@ -165,6 +170,7 @@ async function mockDesktop(page: Page) {
             args.progress.onmessage(result);
             return result;
           }
+          if (cmd === "start_external_drag") return true;
           if (cmd === "save_connection") {
             if ((window as any).__failSave)
               throw new Error("Save validation failed");
@@ -690,4 +696,63 @@ test("modals close on Escape without leaking errors and sidebar groups collapse"
       .getByRole("navigation")
       .getByRole("button", { name: "Integration server" }),
   ).toBeHidden();
+});
+
+test("sidebar online indicator stays a 6px dot and remote folders trigger external drag past window edge", async ({
+  page,
+}) => {
+  await mockDesktop(page);
+  await page.goto("/");
+  await connect(page);
+
+  const dot = page.locator(".connection-open > .status-dot.online");
+  await expect(dot).toBeVisible();
+  const dotBox = (await dot.boundingBox())!;
+  expect(dotBox.width).toBeCloseTo(6, 1);
+  expect(dotBox.height).toBeCloseTo(6, 1);
+
+  const remote = page.getByRole("listbox", { name: "Remote directory" });
+  const folderRow = remote.getByRole("option", { name: /uploads/ });
+  const rowBox = (await folderRow.boundingBox())!;
+  const winWidth = await page.evaluate(() => window.innerWidth);
+
+  await page.mouse.move(rowBox.x + 20, rowBox.y + rowBox.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(rowBox.x + 40, rowBox.y + rowBox.height / 2, {
+    steps: 4,
+  });
+  await page.mouse.move(winWidth + 10, rowBox.y + rowBox.height / 2, {
+    steps: 4,
+  });
+  await page.mouse.up();
+
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (window as any).__commands.find(
+          (c: any) => c.cmd === "start_external_drag",
+        ),
+      ),
+    )
+    .toBeTruthy();
+
+  const dragCmd = await page.evaluate(() =>
+    (window as any).__commands.find(
+      (c: any) => c.cmd === "start_external_drag",
+    ),
+  );
+  expect(dragCmd.args.paths).toEqual(["/home/tester/uploads"]);
+  expect(dragCmd.args.roots).toEqual([
+    { path: "/home/tester/uploads", directory: true, size: 0 },
+  ]);
+
+  await page.evaluate(() =>
+    (window as any).__emit(
+      "external-drag-error",
+      "Simulated async drag failure",
+    ),
+  );
+  await expect(page.locator(".file-error")).toContainText(
+    "Simulated async drag failure",
+  );
 });

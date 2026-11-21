@@ -990,6 +990,99 @@ mod tests {
                 .text,
             "service:\n  port: 9090\n"
         );
+        // Verify large trees (>2,000 items) and >2MB streamed files work in both
+        // batch downloads and Windows external drag-and-drop.
+        sftp.mkdir(Path::new("/minecraft"), 0o755).unwrap();
+        sftp.mkdir(Path::new("/minecraft/plugins"), 0o755).unwrap();
+        sftp.mkdir(Path::new("/minecraft/world"), 0o755).unwrap();
+        sftp.mkdir(Path::new("/minecraft/world/empty"), 0o755)
+            .unwrap();
+        for dir_idx in 0..22 {
+            let folder = format!("/minecraft/plugins/p{dir_idx}");
+            sftp.mkdir(Path::new(&folder), 0o755).unwrap();
+            for file_idx in 0..100 {
+                let file_path = format!("{folder}/f{file_idx}.yml");
+                let mut f = sftp
+                    .open_mode(
+                        Path::new(&file_path),
+                        ssh2::OpenFlags::WRITE | ssh2::OpenFlags::CREATE,
+                        0o644,
+                        ssh2::OpenType::File,
+                    )
+                    .unwrap();
+                f.write_all(b"ok").unwrap();
+                f.close().unwrap();
+            }
+        }
+        let big_payload = vec![0x5Au8; 2 * 1024 * 1024 + 131_072];
+        {
+            let mut f = sftp
+                .open_mode(
+                    Path::new("/minecraft/world/region.bin"),
+                    ssh2::OpenFlags::WRITE | ssh2::OpenFlags::CREATE,
+                    0o644,
+                    ssh2::OpenType::File,
+                )
+                .unwrap();
+            f.write_all(&big_payload).unwrap();
+            f.close().unwrap();
+        }
+        let tree_entries = drag_out::collect_all_drag_entries(
+            &sftp,
+            &[drag_out::DragEntry {
+                remote_path: "/minecraft".into(),
+                relative_windows_path: "minecraft".into(),
+                directory: true,
+                size: 0,
+            }],
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(tree_entries.len() > 2_200);
+        let large_batch_dest = tempfile::tempdir().unwrap();
+        let large_download = files::BatchRequest {
+            job_id: "large-tree".into(),
+            sources: vec!["/minecraft".into()],
+            destination: large_batch_dest.path().to_string_lossy().into(),
+            upload: false,
+            policy: "replace".into(),
+            verify: false,
+        };
+        let large_res = files::run_batch(
+            &ctx,
+            &large_download,
+            &std::sync::atomic::AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(large_res.completed_files, 2201);
+        assert!(large_batch_dest
+            .path()
+            .join("minecraft/world/empty")
+            .is_dir());
+        assert_eq!(
+            fs::read(large_batch_dest.path().join("minecraft/world/region.bin")).unwrap(),
+            big_payload
+        );
+        #[cfg(windows)]
+        {
+            let drop_dest = tempfile::tempdir().unwrap();
+            let drag_ctx = Arc::new(Context {
+                connection: ctx.connection.clone(),
+                secret: Zeroizing::new(ctx.secret.to_string()),
+                fingerprint: ctx.fingerprint.clone(),
+            });
+            drag_out::test_mta_drop_to_dir(drag_ctx, "/minecraft", drop_dest.path()).unwrap();
+            assert!(drop_dest.path().join("minecraft/world/empty").is_dir());
+            assert_eq!(
+                fs::read_to_string(drop_dest.path().join("minecraft/plugins/p21/f99.yml")).unwrap(),
+                "ok"
+            );
+            assert_eq!(
+                fs::read(drop_dest.path().join("minecraft/world/region.bin")).unwrap(),
+                big_payload
+            );
+        }
         ctx.fingerprint = "SHA256:wrong-host-key".into();
         assert!(authenticate(&ctx)
             .err()

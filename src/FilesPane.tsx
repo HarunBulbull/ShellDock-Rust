@@ -8,7 +8,7 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import { Channel, invoke } from "@tauri-apps/api/core";
-import type { UnlistenFn } from "@tauri-apps/api/event";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
@@ -474,6 +474,22 @@ export default function FilesPane({
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [pending, operation]);
+
+  useEffect(() => {
+    if (!desktop) return;
+    let disposed = false;
+    let unlisten: UnlistenFn | undefined;
+    void listen<string>("external-drag-error", (event) => {
+      if (snapshot.current.active) setError(event.payload);
+    }).then((fn) => {
+      if (disposed) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
 
   // Explorer native drops: Remote uploads or Local folder copies.
   useEffect(() => {
@@ -1110,6 +1126,10 @@ export default function FilesPane({
   function moveDrag(e: ReactPointerEvent<HTMLDivElement>) {
     const d = internalDrag.current;
     if (!d || d.pointer !== e.pointerId) return;
+    if ((e.buttons & 1) === 0) {
+      endDrag(e);
+      return;
+    }
     if (!d.moved && Math.hypot(e.clientX - d.x, e.clientY - d.y) < 6) return;
     e.preventDefault();
     d.moved = true;
@@ -1136,7 +1156,19 @@ export default function FilesPane({
     ) {
       d.externalStarted = true;
       const paths = [...d.paths];
+      const roots = paths.map((p) => {
+        const entry = remote.find((item) => item.path === p);
+        return {
+          path: p,
+          directory: entry?.directory ?? true,
+          size: entry?.size ?? 0,
+        };
+      });
       internalDrag.current = null;
+      suppressClick.current = true;
+      window.setTimeout(() => {
+        suppressClick.current = false;
+      }, 0);
       if (d.element.hasPointerCapture(d.pointer))
         d.element.releasePointerCapture(d.pointer);
       setDropZone(null);
@@ -1144,7 +1176,7 @@ export default function FilesPane({
       setDragging(false);
       setDragPreview(null);
       if (id) {
-        void invoke("start_external_drag", { id, paths }).catch((err) =>
+        void invoke("start_external_drag", { id, paths, roots }).catch((err) =>
           setError(errorText(err)),
         );
       }

@@ -296,33 +296,53 @@ pub fn remote_stat(sftp: &Sftp, path: &str) -> Result<Option<ssh2::FileStat>> {
         Err(e) => Err(err(e)),
     }
 }
-fn plan_upload(
+struct PlanContext<'a, F: FnMut(&BatchProgress)> {
+    items: &'a mut Vec<Item>,
+    state: &'a mut BatchProgress,
+    cancel: &'a AtomicBool,
+    last_report: Instant,
+    report: &'a mut F,
+}
+
+impl<F: FnMut(&BatchProgress)> PlanContext<'_, F> {
+    fn tick(&mut self, current: &str) {
+        if self.last_report.elapsed().as_millis() >= 80 {
+            self.state.current = current.to_string();
+            (self.report)(self.state);
+            self.last_report = Instant::now();
+        }
+    }
+}
+
+fn plan_upload<F: FnMut(&BatchProgress)>(
     local: &Path,
     remote: String,
-    items: &mut Vec<Item>,
-    state: &mut BatchProgress,
-    cancel: &AtomicBool,
+    plan: &mut PlanContext<'_, F>,
     depth: usize,
 ) -> Result<()> {
-    check(cancel)?;
-    if depth > 128 || items.len() > 100_000 {
+    check(plan.cancel)?;
+    if depth > 128 || plan.items.len() > 2_000_000 {
         return Err("Transfer tree exceeds the planning limit.".into());
     }
     let metadata = fs::symlink_metadata(local).map_err(err)?;
-    if linked(&metadata) {
-        state.skipped_files += 1;
+    if linked(&metadata) || (!metadata.is_dir() && !metadata.is_file()) {
+        plan.state.skipped_files += 1;
+        plan.state.total_files += 1;
         return Ok(());
     }
-    if !metadata.is_dir() && !metadata.is_file() {
-        return Err("Only regular files and folders can be transferred.".into());
-    }
     let directory = metadata.is_dir();
-    items.push(Item {
+    let size = if directory { 0 } else { metadata.len() };
+    plan.items.push(Item {
         local: local.into(),
         remote: remote.clone(),
         directory,
-        size: if directory { 0 } else { metadata.len() },
+        size,
     });
+    if !directory {
+        plan.state.total_files += 1;
+        plan.state.total_bytes += size;
+    }
+    plan.tick(&local.to_string_lossy());
     if directory {
         let mut children = fs::read_dir(local)
             .map_err(err)?
@@ -336,47 +356,55 @@ fn plan_upload(
             plan_upload(
                 &entry.path(),
                 remote_join(&remote, filename),
-                items,
-                state,
-                cancel,
+                plan,
                 depth + 1,
             )?;
         }
     }
     Ok(())
 }
-fn plan_download(
+fn plan_download<F: FnMut(&BatchProgress)>(
     sftp: &Sftp,
     remote: &str,
     local: PathBuf,
-    items: &mut Vec<Item>,
-    state: &mut BatchProgress,
-    cancel: &AtomicBool,
+    stat_hint: Option<&ssh2::FileStat>,
+    plan: &mut PlanContext<'_, F>,
     depth: usize,
 ) -> Result<()> {
-    check(cancel)?;
-    if depth > 128 || items.len() > 100_000 {
+    check(plan.cancel)?;
+    if depth > 128 || plan.items.len() > 2_000_000 {
         return Err("Transfer tree exceeds the planning limit.".into());
     }
-    let stat = sftp.lstat(Path::new(remote)).map_err(err)?;
-    if stat.file_type() == ssh2::FileType::Symlink {
-        state.skipped_files += 1;
+    let fetched_stat;
+    let stat = match stat_hint.filter(|s| s.perm.is_some()) {
+        Some(s) => s,
+        None => {
+            fetched_stat = sftp.lstat(Path::new(remote)).map_err(err)?;
+            &fetched_stat
+        }
+    };
+    if stat.file_type() == ssh2::FileType::Symlink || (!stat.is_dir() && !stat.is_file()) {
+        plan.state.skipped_files += 1;
+        plan.state.total_files += 1;
         return Ok(());
     }
     let directory = stat.is_dir();
-    if !directory && !stat.is_file() {
-        return Err("Only regular files and folders can be transferred.".into());
-    }
-    items.push(Item {
+    let size = if directory { 0 } else { stat.size.unwrap_or(0) };
+    plan.items.push(Item {
         local: local.clone(),
         remote: remote.into(),
         directory,
-        size: stat.size.unwrap_or(0),
+        size,
     });
+    if !directory {
+        plan.state.total_files += 1;
+        plan.state.total_bytes += size;
+    }
+    plan.tick(remote);
     if directory {
         let mut children = sftp.readdir(Path::new(remote)).map_err(err)?;
         children.sort_by(|a, b| a.0.cmp(&b.0));
-        for (path, _) in children {
+        for (path, child_stat) in children {
             let filename = path
                 .file_name()
                 .and_then(|v| v.to_str())
@@ -384,14 +412,14 @@ fn plan_download(
             if matches!(filename, "." | "..") {
                 continue;
             }
-            download_name(filename)?;
+            let child_remote = remote_join(remote, filename);
+            download_name(filename).map_err(|e| format!("{e} ({child_remote})"))?;
             plan_download(
                 sftp,
-                &remote_join(remote, filename),
+                &child_remote,
                 local.join(filename),
-                items,
-                state,
-                cancel,
+                Some(&child_stat),
+                plan,
                 depth + 1,
             )?;
         }
@@ -531,6 +559,13 @@ pub fn run_batch(
         return Err("Choose an existing local destination folder.".into());
     }
     let mut roots = std::collections::HashSet::new();
+    let mut plan = PlanContext {
+        items: &mut items,
+        state: &mut state,
+        cancel,
+        last_report: Instant::now(),
+        report: &mut report,
+    };
     for source in &request.sources {
         if request.upload {
             let path = Path::new(source);
@@ -547,9 +582,7 @@ pub fn run_batch(
             plan_upload(
                 path,
                 remote_join(&request.destination, filename),
-                &mut items,
-                &mut state,
-                cancel,
+                &mut plan,
                 0,
             )?;
         } else {
@@ -562,9 +595,8 @@ pub fn run_batch(
                 &sftp,
                 source,
                 destination.join(filename),
-                &mut items,
-                &mut state,
-                cancel,
+                None,
+                &mut plan,
                 0,
             )?;
         }
@@ -574,6 +606,7 @@ pub fn run_batch(
     state.status = "transferring".into();
     report(&state);
     let transfer_started = Instant::now();
+    let mut last_dir_report = Instant::now();
     let result = (|| -> Result<()> {
         for item in &items {
             check(cancel)?;
@@ -582,8 +615,11 @@ pub fn run_batch(
             } else {
                 item.remote.clone()
             };
-            report(&state);
             if item.directory {
+                if last_dir_report.elapsed().as_millis() >= 80 {
+                    report(&state);
+                    last_dir_report = Instant::now();
+                }
                 if request.upload {
                     match remote_stat(&sftp, &item.remote)? {
                         Some(stat) if stat.is_dir() => (),
@@ -602,6 +638,7 @@ pub fn run_batch(
                 }
                 continue;
             }
+            report(&state);
             if request.upload {
                 let existing = remote_stat(&sftp, &item.remote)?;
                 if let Some(stat) = &existing {
@@ -688,7 +725,7 @@ pub fn run_batch(
                         cancel,
                         &mut report,
                     )?;
-                    target.sync_all().map_err(err)?;
+                    target.flush().map_err(err)?;
                     drop(target);
                     check(cancel)?;
                     if request.policy == "replace" || fs::symlink_metadata(&item.local).is_err() {
